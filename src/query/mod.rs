@@ -16,7 +16,6 @@ use densa_ui::{Action, ActionKind, Align, EventCx, Style, Ui, WidgetId};
 use densa_widgets::{
     Button, Chart, DockArea, DockAt, DockPanel, DockSide, Label, Panel, TextInput,
 };
-use densa_window::Waker;
 
 use crate::chart::Plotted;
 use crate::source::{grouped, Grid, Source};
@@ -161,14 +160,14 @@ impl Query {
     }
 
     /// Runs the query in the input over the sources as they are now, replacing the one
-    /// running; `waker` wakes the window as the result comes. With `again`, runs the query
+    /// running, calling `wake` as the result comes. With `again`, runs the query
     /// last run instead, its result updating the last one's in place.
     pub(crate) fn run(
         &mut self,
         ui: &mut Ui,
         engine: &Engine,
         sources: &mut [Source],
-        waker: Waker,
+        wake: impl Fn() + Send + 'static,
         again: bool,
     ) {
         // Dropping the stream cancels the query running.
@@ -198,9 +197,7 @@ impl Query {
             true => String::new(),
             false => format!("; {}", skipped.join(", ")),
         };
-        let stream = engine.sql(query).row_numbers(NUMBER).run(move || {
-            waker.wake();
-        });
+        let stream = engine.sql(query).row_numbers(NUMBER).run(wake);
         self.stream = Some(stream);
         self.started = Instant::now();
         if !again {

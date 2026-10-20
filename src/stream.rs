@@ -242,7 +242,7 @@ impl Live {
                 StreamEvent::Batch(batch) => return Some(self.ready(batch)),
                 StreamEvent::Invalid { reason, .. } => {
                     self.skipped.0 += 1;
-                    self.skipped.1 = reason.chars().take(REASON_CHARS).collect();
+                    self.skipped.1 = shortened(&reason);
                 }
                 StreamEvent::Disconnected { reason, retry_in } => {
                     let seconds = retry_in.as_secs_f64();
@@ -317,6 +317,16 @@ impl Live {
         }
         text
     }
+}
+
+/// `reason` cut to [`REASON_CHARS`] characters, with `…` if it was longer.
+fn shortened(reason: &str) -> String {
+    let mut chars = reason.chars();
+    let mut short: String = chars.by_ref().take(REASON_CHARS).collect();
+    if chars.next().is_some() {
+        short.push('…');
+    }
+    short
 }
 
 /// The numbered rows to delete once `next` rows have come, `first` of them before this
@@ -499,6 +509,19 @@ mod tests {
         assert_eq!(live.rows, 2);
         let keyed = quiet("#key=row");
         assert_eq!(keyed.key(), "row", "a key is the rows' own");
+    }
+
+    #[test]
+    fn a_reason_from_the_server_is_cut_short() {
+        assert_eq!(shortened("bad"), "bad");
+        let long = "x".repeat(REASON_CHARS + 5);
+        let short = shortened(&long);
+        assert_eq!(short.chars().count(), REASON_CHARS + 1);
+        assert!(short.ends_with('…'));
+        assert_eq!(
+            shortened(&"é".repeat(REASON_CHARS)),
+            "é".repeat(REASON_CHARS)
+        );
     }
 
     #[test]

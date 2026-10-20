@@ -213,7 +213,10 @@ impl Studio {
         let (Some(query), Some(waker)) = (self.query.as_mut(), self.waker.clone()) else {
             return;
         };
-        query.run(ui, &self.engine, &mut self.sources, waker, again);
+        let wake = move || {
+            waker.wake();
+        };
+        query.run(ui, &self.engine, &mut self.sources, wake, again);
         query.show_status(ui);
     }
 

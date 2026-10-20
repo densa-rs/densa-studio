@@ -434,3 +434,21 @@ fn sources_sql_cannot_see_are_named_and_not_tried_until_they_change() {
     assert_eq!(skipped, ["quiet is not queryable (no rows yet)"]);
     assert!(!sources[0].changed, "not tried again each second");
 }
+
+#[test]
+fn a_live_query_does_not_run_again_while_it_runs_and_a_run_forgets_the_last_failure() {
+    use densa_datafusion::Engine;
+
+    let (mut ui, mut query) = panel(&[1], &[1.0]);
+    query.live = true;
+    query.retry = true;
+    query.ran = "SELECT 1".to_owned();
+    query.ended -= LIVE_EVERY;
+    assert!(query.is_due(false), "a failed run runs again");
+    let engine = Engine::new().unwrap();
+    query.run(&mut ui, &engine, &mut [], || {}, true);
+    assert!(query.is_running());
+    assert!(!query.retry, "this run is the retry");
+    query.ended -= LIVE_EVERY;
+    assert!(!query.is_due(true), "not while it runs");
+}

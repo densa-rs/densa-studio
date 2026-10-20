@@ -7,6 +7,7 @@
 //! saved arrangement, `--seconds N` to close after N seconds.
 
 mod args;
+mod chart;
 mod config;
 mod query;
 mod sample;

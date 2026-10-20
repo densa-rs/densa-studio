@@ -266,6 +266,9 @@ impl App for Studio {
         let Some(ids) = self.ids else {
             return;
         };
+        if let Some(query) = &mut self.query {
+            query.action(ui, &action);
+        }
         let submitted = action.kind == ActionKind::Submitted;
         if submitted {
             // The user moved on: what went wrong before is old news.

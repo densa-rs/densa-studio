@@ -1,19 +1,24 @@
 //! The SQL panel: a query over every source, run by DataFusion, its result streamed into a
-//! grid as it is computed.
+//! grid as it is computed, and charted in a tab of its own.
 
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use densa_arrow::LiveModel;
+use densa_chart::{Axis, ChartModel};
 use densa_data::LiveTable;
 use densa_datafusion::{Engine, QueryEvent, QueryStream};
-use densa_ui::{Align, Style, Ui, WidgetId};
-use densa_widgets::{DockArea, DockAt, DockPanel, Label, Panel, TextInput};
+use densa_ui::{Action, ActionKind, Align, EventCx, Style, Ui, WidgetId};
+use densa_widgets::{Chart, DockArea, DockAt, DockPanel, DockSide, Label, Panel, TextInput};
 use densa_window::Waker;
 
+use crate::chart::Plotted;
 use crate::source::{grouped, Grid, Source};
+
+type ResultChart = Chart<Plotted>;
 
 /// The key column of a result: its rows are numbered as they arrive. Not `row`, which every
 /// source has.
@@ -27,6 +32,11 @@ pub(crate) struct Query {
     pub(crate) input: WidgetId,
     grid: WidgetId,
     status: WidgetId,
+    /// The chart (in a tab of its own) and the line above it saying what it shows.
+    chart: WidgetId,
+    caption: WidgetId,
+    /// Whether the chart shows the whole result as it grows: until the user moves it.
+    fit: bool,
     stream: Option<QueryStream>,
     /// Where the query stands.
     state: String,
@@ -57,11 +67,26 @@ impl Query {
         let line = Style::row().padding(4.0).shrink(0.0);
         let line = ui.add(body, Panel::transparent(), line)?;
         let status = ui.add(line, Label::new("").dim(), Style::row())?;
+
+        let spec = DockPanel::new("Chart").with_key("chart");
+        let right = DockAt::Beside(panel, DockSide::Right);
+        let chart_panel = DockArea::add_panel(ui, dock, Panel::new(), spec, right)?;
+        let body = ui.add(chart_panel, Panel::transparent(), Style::column().grow(1.0))?;
+        let line = Style::row().padding(6.0).shrink(0.0);
+        let line = ui.add(body, Panel::transparent(), line)?;
+        let waiting = Plotted::waiting();
+        let caption = Label::new(waiting.caption()).wrapping().dim();
+        let caption = ui.add(line, caption, Style::row().grow(1.0))?;
+        let chart = ResultChart::new(waiting, 1.0);
+        let chart = ui.add(body, chart, ResultChart::style())?;
         Ok(Self {
             panel,
             input,
             grid,
             status,
+            chart,
+            caption,
+            fit: true,
             stream: None,
             state: "Type a query and press Enter".to_owned(),
             started: Instant::now(),
@@ -135,6 +160,8 @@ impl Query {
                         // clear that result so it is not taken for this one's.
                         self.stream = None;
                         let _ = self.replace(ui, waiting());
+                        let caption = "Not charted: the result cannot be shown".to_owned();
+                        self.set_chart(ui, Plotted::not_charted(caption));
                         self.state = format!("Cannot show the result: {error}");
                     }
                 }
@@ -143,9 +170,10 @@ impl Query {
                     let mut rows = 0;
                     ui.update::<Grid, _>(self.grid, |grid, cx| {
                         let table = grid.model_mut(cx).table_mut();
-                        refused = table.upsert(batch).err();
+                        refused = table.upsert(batch.clone()).err();
                         rows = table.len();
                     });
+                    self.chart_rows(ui, batch);
                     if let Some(error) = refused {
                         self.state = format!("Rows refused: {error}");
                     }
@@ -161,6 +189,8 @@ impl Query {
                 }
                 QueryEvent::Failed { reason } => {
                     let _ = self.replace(ui, waiting());
+                    let failed = "Not charted: the query failed".to_owned();
+                    self.set_chart(ui, Plotted::not_charted(failed));
                     let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
                     self.state = format!("Failed: {reason}");
                     self.stream = None;
@@ -170,13 +200,72 @@ impl Query {
         }
     }
 
-    /// A new result: a new table, the last result's rows gone.
+    /// A new result: a new table and chart, the last result's rows gone.
     fn replace(&mut self, ui: &mut Ui, schema: Arc<Schema>) -> Result<(), String> {
-        let fresh = LiveTable::new(schema, NUMBER).map_err(|e| e.to_string())?;
+        let fresh = LiveTable::new(schema.clone(), NUMBER).map_err(|e| e.to_string())?;
         ui.update::<Grid, _>(self.grid, |grid, cx| {
             *grid.model_mut(cx).table_mut() = fresh
         });
+        self.set_chart(ui, Plotted::new(&schema, NUMBER));
         Ok(())
+    }
+
+    /// Charts something else, showing all of it as it comes.
+    fn set_chart(&mut self, ui: &mut Ui, plotted: Plotted) {
+        let caption = plotted.caption().to_owned();
+        ui.update::<ResultChart, _>(self.chart, |chart, cx| {
+            *chart.model_mut(cx) = plotted;
+            chart.follow(cx);
+        });
+        ui.update::<Label, _>(self.caption, |label, cx| label.set_text(cx, caption));
+        self.fit = true;
+    }
+
+    /// Charts rows of the result, showing all of it unless the user moved the chart.
+    fn chart_rows(&mut self, ui: &mut Ui, batch: RecordBatch) {
+        let fit = self.fit;
+        let mut refused = None;
+        ui.update::<ResultChart, _>(self.chart, |chart, cx| {
+            refused = chart.model_mut(cx).add(batch).err();
+            if fit {
+                show_all(chart, cx);
+            }
+        });
+        if let Some(error) = refused {
+            self.state = format!("Rows not charted: {error}");
+        }
+    }
+
+    /// Follows what happened to the result's grid and chart: a row selected in the grid is
+    /// marked on the chart, and a chart the user moved stays where they put it.
+    pub(crate) fn action(&mut self, ui: &mut Ui, action: &Action) {
+        if action.source == self.grid && matches!(action.kind, ActionKind::Selected(_)) {
+            self.mark_selected(ui);
+        } else if action.source == self.chart && action.kind == ActionKind::Changed {
+            self.fit = false;
+        }
+    }
+
+    /// Marks the grid's selected row on the chart, moving the chart to it if it is out of
+    /// sight.
+    fn mark_selected(&mut self, ui: &mut Ui) {
+        let key = ui.widget::<Grid>(self.grid).and_then(selected_key);
+        let mut moved = false;
+        ui.update::<ResultChart, _>(self.chart, |chart, cx| {
+            let Some(x) = chart.model_mut(cx).mark_row(key) else {
+                return;
+            };
+            if let Some(shown) = chart.x_axis() {
+                if x < shown.start() || x > shown.end() {
+                    let middle = shown.start() + shown.span() / 2.0;
+                    chart.show(cx, shown.shifted(x - middle));
+                    moved = true;
+                }
+            }
+        });
+        if moved {
+            self.fit = false;
+        }
     }
 
     /// Writes where the query stands under its result.
@@ -189,6 +278,25 @@ impl Query {
     }
 }
 
+/// Shows all of the chart's data.
+fn show_all(chart: &mut ResultChart, cx: &mut EventCx<'_>) {
+    let model = chart.model();
+    if let Some((low, high)) = model.x_extent() {
+        let all = Axis::new(low, high, model.x_kind()).padded(0.02);
+        chart.show(cx, all);
+    }
+}
+
+/// The key of the row selected in `grid`, if one is.
+fn selected_key(grid: &Grid) -> Option<u64> {
+    let model = grid.model();
+    let table = model.table();
+    let at = table.row_of(model.record(grid.selected()?)?)?;
+    let keys = table.batches().get(at.batch)?.column_by_name(NUMBER)?;
+    let keys = keys.as_any().downcast_ref::<UInt64Array>()?;
+    keys.is_valid(at.row).then(|| keys.value(at.row))
+}
+
 /// Columns come with a result: until then, an empty table of the key alone.
 fn waiting() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new(
@@ -196,4 +304,153 @@ fn waiting() -> Arc<Schema> {
         DataType::UInt64,
         false,
     )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{ArrayRef, Float64Array, Int64Array};
+    use densa_draw::{Canvas, InstanceBuffer, Size};
+    use densa_paragraph::TextSystem;
+    use densa_text::{AtlasConfig, GlyphCache};
+
+    use super::*;
+
+    /// A SQL panel in a dock, showing a result of `x` and `y` (numbered from 0) as it would
+    /// come from a query.
+    fn panel(x: &[i64], y: &[f64]) -> (Ui, Query) {
+        let mut ui = Ui::new(TextSystem::bundled().unwrap());
+        ui.resize(Size::new(1_000.0, 600.0));
+        let dock = ui
+            .add(ui.root(), DockArea::new(), DockArea::style())
+            .unwrap();
+        let mut query = Query::add(&mut ui, dock, DockAt::First, "").unwrap();
+        let rows = rows(0, x, y);
+        query.replace(&mut ui, rows.schema()).unwrap();
+        take(&mut ui, &mut query, rows);
+        (ui, query)
+    }
+
+    fn rows(first: u64, x: &[i64], y: &[f64]) -> RecordBatch {
+        let count = x.len() as u64;
+        RecordBatch::try_from_iter([
+            ("x", Arc::new(Int64Array::from(x.to_vec())) as ArrayRef),
+            ("y", Arc::new(Float64Array::from(y.to_vec()))),
+            (
+                NUMBER,
+                Arc::new(UInt64Array::from_iter_values(first..first + count)),
+            ),
+        ])
+        .unwrap()
+    }
+
+    /// Takes in rows as `take` does: into the grid and the chart.
+    fn take(ui: &mut Ui, query: &mut Query, rows: RecordBatch) {
+        ui.update::<Grid, _>(query.grid, |grid, cx| {
+            grid.model_mut(cx).table_mut().upsert(rows.clone()).unwrap();
+        });
+        query.chart_rows(ui, rows);
+    }
+
+    /// Lays out and paints a frame: the grid catches up with its rows when painted.
+    fn frame(ui: &mut Ui) {
+        let mut cache = GlyphCache::new(AtlasConfig::default());
+        let mut out = InstanceBuffer::with_capacity(65_536);
+        ui.layout();
+        ui.paint(&mut Canvas::begin(&mut cache, &mut out));
+    }
+
+    fn chart(ui: &Ui, query: &Query) -> (f64, f64) {
+        let x = ui
+            .widget::<ResultChart>(query.chart)
+            .unwrap()
+            .x_axis()
+            .unwrap();
+        (x.start(), x.end())
+    }
+
+    fn caption(ui: &Ui, query: &Query) -> String {
+        ui.widget::<Label>(query.caption).unwrap().text().to_owned()
+    }
+
+    #[test]
+    fn the_chart_shows_the_whole_result_until_the_user_moves_it() {
+        let (mut ui, mut query) = panel(&[10, 20], &[1.0, 2.0]);
+        assert_eq!(caption(&ui, &query), "x across: y");
+        let (start, end) = chart(&ui, &query);
+        assert!(
+            start < 10.0 && start > 9.0 && end > 20.0 && end < 21.0,
+            "{start}..{end}"
+        );
+
+        take(&mut ui, &mut query, rows(2, &[0, 40], &[0.0, 4.0]));
+        let (start, end) = chart(&ui, &query);
+        assert!(
+            start < 0.0 && end > 40.0,
+            "grew with the result: {start}..{end}"
+        );
+
+        let moved = Action {
+            source: query.chart,
+            kind: ActionKind::Changed,
+        };
+        query.action(&mut ui, &moved);
+        take(&mut ui, &mut query, rows(4, &[100], &[1.0]));
+        assert_eq!(
+            chart(&ui, &query),
+            (start, end),
+            "left where the user put it"
+        );
+
+        query.replace(&mut ui, rows(0, &[], &[]).schema()).unwrap();
+        take(&mut ui, &mut query, rows(0, &[5, 6], &[1.0, 1.0]));
+        let (start, end) = chart(&ui, &query);
+        assert!(
+            start < 5.0 && start > 4.0 && end > 6.0,
+            "a new result fits again"
+        );
+    }
+
+    #[test]
+    fn the_row_selected_in_the_grid_is_marked_and_brought_into_sight() {
+        let (mut ui, mut query) = panel(&[10, 20, 30], &[1.0, 2.0, 3.0]);
+        frame(&mut ui);
+        let select = |ui: &mut Ui, query: &mut Query, row: Option<usize>| {
+            ui.update::<Grid, _>(query.grid, |grid, cx| grid.select(cx, row));
+            let selected = Action {
+                source: query.grid,
+                kind: ActionKind::Selected(row.unwrap_or(0)),
+            };
+            query.action(ui, &selected);
+            ui.widget::<ResultChart>(query.chart)
+                .unwrap()
+                .model()
+                .mark()
+        };
+        assert_eq!(select(&mut ui, &mut query, Some(1)), Some(20.0));
+        assert_eq!(select(&mut ui, &mut query, None), None);
+
+        ui.update::<ResultChart, _>(query.chart, |chart, cx| {
+            chart.show(cx, Axis::number(10.0, 14.0));
+        });
+        // Away from the newest row: a view reaching the newest follows it.
+        assert_eq!(select(&mut ui, &mut query, Some(1)), Some(20.0));
+        let (start, end) = chart(&ui, &query);
+        assert!(start < 20.0 && end > 20.0, "moved to it: {start}..{end}");
+        assert!(end - start < 5.0, "as wide as it was: {start}..{end}");
+        take(&mut ui, &mut query, rows(3, &[1_000], &[1.0]));
+        assert_eq!(chart(&ui, &query), (start, end), "and left there");
+    }
+
+    #[test]
+    fn a_failed_query_says_so_in_the_chart() {
+        let (mut ui, mut query) = panel(&[1], &[1.0]);
+        let failed = "Not charted: the query failed".to_owned();
+        query.set_chart(&mut ui, Plotted::not_charted(failed.clone()));
+        assert_eq!(caption(&ui, &query), failed);
+        assert!(ui
+            .widget::<ResultChart>(query.chart)
+            .unwrap()
+            .x_axis()
+            .is_none());
+    }
 }

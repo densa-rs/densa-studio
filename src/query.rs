@@ -483,6 +483,28 @@ mod tests {
     }
 
     #[test]
+    fn a_view_must_reach_both_ends_to_fit_again_and_a_new_result_always_does() {
+        let (mut ui, mut query) = panel(&[10, 20], &[1.0, 2.0]);
+        let moved = Action {
+            source: query.chart,
+            kind: ActionKind::Changed,
+        };
+        ui.update::<ResultChart, _>(query.chart, |chart, cx| {
+            chart.show(cx, Axis::number(16.0, 21.0));
+        });
+        query.action(&mut ui, &moved);
+        assert!(!query.fit, "the start is out of sight");
+
+        query.replace(&mut ui, rows(0, &[], &[]).schema()).unwrap();
+        take(&mut ui, &mut query, rows(0, &[100, 200], &[1.0, 1.0]));
+        let (start, end) = chart(&ui, &query);
+        assert!(
+            start < 100.0 && end > 200.0,
+            "a new result fits: {start}..{end}"
+        );
+    }
+
+    #[test]
     fn a_fitted_chart_is_not_taken_for_one_following_the_newest() {
         let (ui, query) = panel(&[10, 20, 30], &[1.0, 2.0, 3.0]);
         let chart = ui.widget::<ResultChart>(query.chart).unwrap();

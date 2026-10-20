@@ -568,6 +568,35 @@ mod tests {
     }
 
     #[test]
+    fn many_rows_of_the_same_x_keep_the_order_they_came_in() {
+        let first = batch(0, vec![("x", ints(&[5])), ("y", ints(&[0]))]);
+        let mut chart = Plotted::new(&first.schema(), "#");
+        chart.add(&first).unwrap();
+        let x: Vec<i64> = (0..2_000).map(|i| i % 3).collect();
+        let y: Vec<i64> = (1..=2_000).collect();
+        chart
+            .add(&batch(1, vec![("x", ints(&x)), ("y", ints(&y))]))
+            .unwrap();
+        chart.finish();
+        let points = points(&chart, 0);
+        assert!(points
+            .windows(2)
+            .all(|w| w[0].0 < w[1].0 || w[0].1 < w[1].1));
+    }
+
+    #[test]
+    fn rows_out_of_order_after_a_while_are_sorted_in_as_they_come() {
+        let first = batch(0, vec![("x", ints(&[5])), ("y", ints(&[0]))]);
+        let mut chart = Plotted::new(&first.schema(), "#");
+        chart.add(&first).unwrap();
+        chart.charted.as_mut().unwrap().sorted_at -= SORT_EVERY;
+        chart
+            .add(&batch(1, vec![("x", ints(&[1])), ("y", ints(&[0]))]))
+            .unwrap();
+        assert_eq!(chart.x_extent(), Some((1.0, 5.0)), "no paint needed");
+    }
+
+    #[test]
     fn rows_without_a_place_across_are_left_out() {
         let x = floats(&[f64::NAN, 2.0, f64::INFINITY, f64::NEG_INFINITY, 1.0]);
         let chart = chart_of(vec![("x", x), ("y", ints(&[1, 2, 3, 4, 5]))]);
@@ -643,6 +672,15 @@ mod tests {
             chart.caption(),
             "x across; a, b, c, d below (the first 4 of 5 number columns)"
         );
+    }
+
+    #[test]
+    fn four_number_columns_are_all_shown() {
+        let columns: Vec<(&str, ArrayRef)> = ["x", "a", "b", "c", "d"]
+            .into_iter()
+            .map(|name| (name, ints(&[1, 2])))
+            .collect();
+        assert_eq!(chart_of(columns).caption(), "x across; a, b, c, d below");
     }
 
     #[test]

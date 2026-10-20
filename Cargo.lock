@@ -1862,7 +1862,7 @@ dependencies = [
 [[package]]
 name = "densa-arrow"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "arrow-array 60.0.0",
  "arrow-buffer 60.0.0",
@@ -1876,7 +1876,7 @@ dependencies = [
 [[package]]
 name = "densa-chart"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "densa-core",
  "densa-draw",
@@ -1887,12 +1887,12 @@ dependencies = [
 [[package]]
 name = "densa-core"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 
 [[package]]
 name = "densa-data"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "arrow-array 60.0.0",
  "arrow-schema 60.0.0",
@@ -1916,7 +1916,7 @@ dependencies = [
 [[package]]
 name = "densa-draw"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "bytemuck",
  "densa-core",
@@ -1937,12 +1937,12 @@ dependencies = [
 [[package]]
 name = "densa-fmt"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 
 [[package]]
 name = "densa-grid"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "densa-core",
  "densa-draw",
@@ -1953,7 +1953,7 @@ dependencies = [
 [[package]]
 name = "densa-paragraph"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "densa-core",
  "densa-text",
@@ -1965,7 +1965,7 @@ dependencies = [
 [[package]]
 name = "densa-render"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "bytemuck",
  "densa-core",
@@ -1999,7 +1999,7 @@ dependencies = [
 [[package]]
 name = "densa-text"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "densa-core",
  "etagere",
@@ -2011,7 +2011,7 @@ dependencies = [
 [[package]]
 name = "densa-ui"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "densa-core",
  "densa-draw",
@@ -2022,7 +2022,7 @@ dependencies = [
 [[package]]
 name = "densa-widgets"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "densa-chart",
  "densa-core",
@@ -2036,7 +2036,7 @@ dependencies = [
 [[package]]
 name = "densa-window"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa#81176d3de58591a768f2c7fb64ef40913c0c43fc"
+source = "git+https://github.com/densa-rs/densa#0c0e4408810ab90459292397924e9daffdedb54f"
 dependencies = [
  "accesskit",
  "accesskit_winit",

@@ -166,19 +166,20 @@ impl Query {
                     }
                 }
                 QueryEvent::Batch(batch) => {
+                    self.chart_rows(ui, &batch);
                     let mut refused = None;
                     let mut rows = 0;
                     ui.update::<Grid, _>(self.grid, |grid, cx| {
                         let table = grid.model_mut(cx).table_mut();
-                        refused = table.upsert(batch.clone()).err();
+                        refused = table.upsert(batch).err();
                         rows = table.len();
                     });
-                    self.chart_rows(ui, batch);
                     if let Some(error) = refused {
                         self.state = format!("Rows refused: {error}");
                     }
                     if rows >= MAX_ROWS {
                         self.stream = None;
+                        self.finish_chart(ui);
                         self.state = format!("Cut off at {} rows", grouped(MAX_ROWS as u64));
                     }
                 }
@@ -186,6 +187,7 @@ impl Query {
                     let seconds = self.started.elapsed().as_secs_f64();
                     self.state = format!("Done in {seconds:.2} s");
                     self.stream = None;
+                    self.finish_chart(ui);
                 }
                 QueryEvent::Failed { reason } => {
                     let _ = self.replace(ui, waiting());
@@ -215,14 +217,14 @@ impl Query {
         let caption = plotted.caption().to_owned();
         ui.update::<ResultChart, _>(self.chart, |chart, cx| {
             *chart.model_mut(cx) = plotted;
-            chart.follow(cx);
         });
         ui.update::<Label, _>(self.caption, |label, cx| label.set_text(cx, caption));
         self.fit = true;
     }
 
-    /// Charts rows of the result, showing all of it unless the user moved the chart.
-    fn chart_rows(&mut self, ui: &mut Ui, batch: RecordBatch) {
+    /// Charts rows of the result, showing all of it unless the user moved the chart. Rows
+    /// it cannot take in end the chart, saying why: a chart missing rows would mislead.
+    fn chart_rows(&mut self, ui: &mut Ui, batch: &RecordBatch) {
         let fit = self.fit;
         let mut refused = None;
         ui.update::<ResultChart, _>(self.chart, |chart, cx| {
@@ -232,17 +234,33 @@ impl Query {
             }
         });
         if let Some(error) = refused {
-            self.state = format!("Rows not charted: {error}");
+            self.set_chart(ui, Plotted::not_charted(format!("Not charted: {error}")));
         }
     }
 
+    /// The whole result has arrived: the chart shows the last of it.
+    fn finish_chart(&mut self, ui: &mut Ui) {
+        let fit = self.fit;
+        let mut caption = String::new();
+        ui.update::<ResultChart, _>(self.chart, |chart, cx| {
+            chart.model_mut(cx).finish();
+            if fit {
+                show_all(chart, cx);
+            }
+            chart.model().caption().clone_into(&mut caption);
+        });
+        ui.update::<Label, _>(self.caption, |label, cx| label.set_text(cx, caption));
+    }
+
     /// Follows what happened to the result's grid and chart: a row selected in the grid is
-    /// marked on the chart, and a chart the user moved stays where they put it.
+    /// marked on the chart, and a chart the user moved stays where they put it, until it
+    /// shows all of the result again.
     pub(crate) fn action(&mut self, ui: &mut Ui, action: &Action) {
         if action.source == self.grid && matches!(action.kind, ActionKind::Selected(_)) {
             self.mark_selected(ui);
         } else if action.source == self.chart && action.kind == ActionKind::Changed {
-            self.fit = false;
+            let chart = ui.widget::<ResultChart>(self.chart);
+            self.fit = chart.is_some_and(shows_all);
         }
     }
 
@@ -285,6 +303,14 @@ fn show_all(chart: &mut ResultChart, cx: &mut EventCx<'_>) {
         let all = Axis::new(low, high, model.x_kind()).padded(0.02);
         chart.show(cx, all);
     }
+}
+
+/// Whether the chart shows all of its data.
+fn shows_all(chart: &ResultChart) -> bool {
+    let (Some(shown), Some((low, high))) = (chart.x_axis(), chart.model().x_extent()) else {
+        return false;
+    };
+    shown.start() <= low && shown.end() >= high
 }
 
 /// The key of the row selected in `grid`, if one is.
@@ -345,10 +371,10 @@ mod tests {
 
     /// Takes in rows as `take` does: into the grid and the chart.
     fn take(ui: &mut Ui, query: &mut Query, rows: RecordBatch) {
+        query.chart_rows(ui, &rows);
         ui.update::<Grid, _>(query.grid, |grid, cx| {
-            grid.model_mut(cx).table_mut().upsert(rows.clone()).unwrap();
+            grid.model_mut(cx).table_mut().upsert(rows).unwrap();
         });
-        query.chart_rows(ui, rows);
     }
 
     /// Lays out and paints a frame: the grid catches up with its rows when painted.
@@ -375,17 +401,17 @@ mod tests {
     #[test]
     fn the_chart_shows_the_whole_result_until_the_user_moves_it() {
         let (mut ui, mut query) = panel(&[10, 20], &[1.0, 2.0]);
-        assert_eq!(caption(&ui, &query), "x across: y");
+        assert_eq!(caption(&ui, &query), "x across; y below");
         let (start, end) = chart(&ui, &query);
         assert!(
             start < 10.0 && start > 9.0 && end > 20.0 && end < 21.0,
             "{start}..{end}"
         );
 
-        take(&mut ui, &mut query, rows(2, &[0, 40], &[0.0, 4.0]));
+        take(&mut ui, &mut query, rows(2, &[30, 40], &[0.0, 4.0]));
         let (start, end) = chart(&ui, &query);
         assert!(
-            start < 0.0 && end > 40.0,
+            start < 10.0 && end > 40.0,
             "grew with the result: {start}..{end}"
         );
 
@@ -393,12 +419,27 @@ mod tests {
             source: query.chart,
             kind: ActionKind::Changed,
         };
+        ui.update::<ResultChart, _>(query.chart, |chart, cx| {
+            chart.show(cx, Axis::number(10.0, 20.0));
+        });
         query.action(&mut ui, &moved);
         take(&mut ui, &mut query, rows(4, &[100], &[1.0]));
-        assert_eq!(
-            chart(&ui, &query),
-            (start, end),
-            "left where the user put it"
+        let (start, end) = chart(&ui, &query);
+        assert!(
+            start > 9.0 && end < 21.0,
+            "left where the user put it: {start}..{end}"
+        );
+
+        // Zoomed out to all of it: it follows the result again.
+        ui.update::<ResultChart, _>(query.chart, |chart, cx| {
+            chart.show(cx, Axis::number(-10.0, 110.0));
+        });
+        query.action(&mut ui, &moved);
+        take(&mut ui, &mut query, rows(5, &[200], &[1.0]));
+        let (start, end) = chart(&ui, &query);
+        assert!(
+            start > 5.0 && start < 10.0 && end > 200.0,
+            "fits again: {start}..{end}"
         );
 
         query.replace(&mut ui, rows(0, &[], &[]).schema()).unwrap();
@@ -439,6 +480,65 @@ mod tests {
         assert!(end - start < 5.0, "as wide as it was: {start}..{end}");
         take(&mut ui, &mut query, rows(3, &[1_000], &[1.0]));
         assert_eq!(chart(&ui, &query), (start, end), "and left there");
+    }
+
+    #[test]
+    fn a_fitted_chart_is_not_taken_for_one_following_the_newest() {
+        let (ui, query) = panel(&[10, 20, 30], &[1.0, 2.0, 3.0]);
+        let chart = ui.widget::<ResultChart>(query.chart).unwrap();
+        assert!(
+            !chart.is_following(),
+            "it would show only the newest span as rows come"
+        );
+        assert!(shows_all(chart));
+    }
+
+    #[test]
+    fn a_new_result_clears_the_mark_and_an_empty_one_says_so() {
+        let (mut ui, mut query) = panel(&[10, 20], &[1.0, 2.0]);
+        frame(&mut ui);
+        ui.update::<Grid, _>(query.grid, |grid, cx| grid.select(cx, Some(1)));
+        let selected = Action {
+            source: query.grid,
+            kind: ActionKind::Selected(1),
+        };
+        query.action(&mut ui, &selected);
+        let mark = |ui: &Ui, query: &Query| {
+            ui.widget::<ResultChart>(query.chart)
+                .unwrap()
+                .model()
+                .mark()
+        };
+        assert_eq!(mark(&ui, &query), Some(20.0));
+        query.replace(&mut ui, rows(0, &[], &[]).schema()).unwrap();
+        assert_eq!(mark(&ui, &query), None);
+        query.finish_chart(&mut ui);
+        assert_eq!(
+            caption(&ui, &query),
+            "Not charted: no row has a value for x"
+        );
+    }
+
+    #[test]
+    fn rows_the_chart_cannot_take_end_it_and_say_why() {
+        let (mut ui, mut query) = panel(&[1], &[1.0]);
+        let signed = RecordBatch::try_from_iter([
+            ("x", Arc::new(Int64Array::from(vec![2])) as ArrayRef),
+            ("y", Arc::new(Float64Array::from(vec![2.0]))),
+            (NUMBER, Arc::new(Int64Array::from(vec![1]))),
+        ])
+        .unwrap();
+        query.chart_rows(&mut ui, &signed);
+        assert!(
+            caption(&ui, &query).starts_with("Not charted: "),
+            "{}",
+            caption(&ui, &query)
+        );
+        assert!(ui
+            .widget::<ResultChart>(query.chart)
+            .unwrap()
+            .x_axis()
+            .is_none());
     }
 
     #[test]

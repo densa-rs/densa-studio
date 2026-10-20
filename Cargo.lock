@@ -1979,6 +1979,7 @@ name = "densa-studio"
 version = "0.1.0"
 dependencies = [
  "arrow-array 60.0.0",
+ "arrow-cast 60.0.0",
  "arrow-schema 60.0.0",
  "densa-arrow",
  "densa-chart",

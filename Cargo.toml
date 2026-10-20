@@ -1,0 +1,36 @@
+[package]
+name = "densa-studio"
+description = "Open Parquet, CSV and live data and explore it at once: grids, SQL and a docking workspace, built on densa"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+homepage = "https://densa.dev"
+repository = "https://github.com/densa-rs/densa-studio"
+readme = "README.md"
+# DataFusion 55's minimum.
+rust-version = "1.94"
+# An application, not a library: installed from this repository for now.
+publish = false
+
+[dependencies]
+# Arrow 60, as densa uses.
+arrow-array = "60"
+arrow-schema = "60"
+parquet = { version = "60", default-features = false, features = ["arrow"] }
+# densa and its connectors from their main branches until their next releases (Cargo.lock
+# pins the commits).
+densa-arrow = { git = "https://github.com/densa-rs/densa" }
+densa-data = { git = "https://github.com/densa-rs/densa" }
+densa-ui = { git = "https://github.com/densa-rs/densa" }
+densa-widgets = { git = "https://github.com/densa-rs/densa" }
+densa-window = { git = "https://github.com/densa-rs/densa" }
+densa-datafusion = { git = "https://github.com/densa-rs/densa-connectors" }
+densa-files = { git = "https://github.com/densa-rs/densa-connectors" }
+# The connectors' sample web requests, for --sample.
+samples = { git = "https://github.com/densa-rs/densa-connectors" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+debug = 1

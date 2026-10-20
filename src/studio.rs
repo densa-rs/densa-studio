@@ -1,0 +1,340 @@
+//! The application: a toolbar to open files, a docking workspace of sources and SQL, and a
+//! status bar.
+
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use densa_datafusion::Engine;
+use densa_ui::{Action, ActionKind, Align, Style, Theme, Ui, WidgetId};
+use densa_widgets::{DockArea, DockAt, DockLayout, DockSide, Label, Panel, TextInput};
+use densa_window::{App, Host, Waker};
+
+use crate::config;
+use crate::query::Query;
+use crate::source::{table_name, Source};
+
+/// How often the status bar is written again while something loads.
+const STATUS_EVERY: Duration = Duration::from_millis(200);
+/// The longest a frame spends taking in rows: the rest wait for the next frame.
+const FRAME_BUDGET: Duration = Duration::from_millis(6);
+/// The part of it a query's result gets first, so it shows while files still load.
+const QUERY_BUDGET: Duration = Duration::from_millis(2);
+/// What the welcome tab says.
+const WELCOME: &str = "Open a CSV or Parquet file: type its path in the box above and press \
+                       Enter, or start Studio with paths. Each file opens in a tab of its own \
+                       as it loads, and the SQL panel queries every file by its name.";
+
+/// What Studio starts with.
+pub(crate) struct Start {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) query: Option<String>,
+    pub(crate) light: bool,
+    /// Ignore the arrangement saved last time.
+    pub(crate) fresh: bool,
+    pub(crate) close_at: Option<Instant>,
+}
+
+pub(crate) struct Studio {
+    start: Start,
+    engine: Engine,
+    waker: Option<Waker>,
+    ids: Option<Ids>,
+    sources: Vec<Source>,
+    query: Option<Query>,
+    /// The welcome tab, while no file is open.
+    welcome: Option<WidgetId>,
+    /// Where the arrangement is saved; `None` once a saved one could not be read, so it is
+    /// not overwritten.
+    layout_file: Option<PathBuf>,
+    /// The last thing to tell the user.
+    note: String,
+    /// What went wrong, until the user does something else: shown before any note.
+    problems: Vec<String>,
+    /// The first query runs once the files have loaded.
+    query_pending: bool,
+    /// The source taking rows in first next frame: they take turns.
+    first_source: usize,
+    status_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct Ids {
+    dock: WidgetId,
+    open: WidgetId,
+    status: WidgetId,
+}
+
+impl Studio {
+    pub(crate) fn new(start: Start) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            query_pending: false,
+            first_source: 0,
+            start,
+            engine: Engine::new()?,
+            waker: None,
+            ids: None,
+            sources: Vec::new(),
+            query: None,
+            welcome: None,
+            layout_file: config::layout_file(),
+            note: String::new(),
+            problems: Vec::new(),
+            status_at: Instant::now(),
+        })
+    }
+
+    /// Something that went wrong, shown until the user does something else (once, however
+    /// often it happens).
+    fn problem(&mut self, text: String) {
+        if !self.problems.contains(&text) {
+            self.problems.push(text);
+        }
+    }
+
+    /// Opens `path` as a new source, in a tab beside the other sources; a file already open
+    /// has its tab shown instead.
+    fn open(&mut self, ui: &mut Ui, path: &Path) {
+        let (Some(ids), Some(waker)) = (self.ids, self.waker.clone()) else {
+            return;
+        };
+        let canonical = std::fs::canonicalize(path).ok();
+        if let Some(open) = self
+            .sources
+            .iter()
+            .find(|s| Some(&s.path) == canonical.as_ref())
+        {
+            let _ = DockArea::show_panel(ui, ids.dock, open.panel);
+            self.note = format!("Already open as {}", open.name);
+            return;
+        }
+        let taken: Vec<String> = self.sources.iter().map(|s| s.name.clone()).collect();
+        let name = table_name(path, &taken);
+        let at = match (self.sources.first(), self.welcome, &self.query) {
+            (Some(first), _, _) => DockAt::With(first.panel),
+            (None, Some(welcome), _) => DockAt::With(welcome),
+            (None, None, Some(query)) => DockAt::Beside(query.panel, DockSide::Top),
+            (None, None, None) => DockAt::First,
+        };
+        match Source::open(ui, ids.dock, path, name, at, waker) {
+            Ok(source) => {
+                let file = path.file_name().unwrap_or(path.as_os_str());
+                self.note = format!("Opened {} as {}", file.to_string_lossy(), source.name);
+                let _ = DockArea::show_panel(ui, ids.dock, source.panel);
+                self.sources.push(source);
+                if let Some(welcome) = self.welcome.take() {
+                    let _ = DockArea::remove_panel(ui, ids.dock, welcome);
+                }
+            }
+            Err(error) => self.problem(format!("{} not opened: {error}", path.display())),
+        }
+    }
+
+    /// Arranges the dock as it was saved last time, unless starting fresh.
+    fn restore(&mut self, ui: &mut Ui) {
+        let Some(file) = self.layout_file.clone() else {
+            return;
+        };
+        if self.start.fresh {
+            return;
+        }
+        let restored = match std::fs::read_to_string(&file) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => Err(error.to_string()),
+            Ok(text) => text
+                .parse::<DockLayout>()
+                .map_err(|e| e.to_string())
+                .and_then(|layout| {
+                    let dock = self.ids.ok_or("no dock")?.dock;
+                    DockArea::restore_layout(ui, dock, &layout).map_err(|e| e.to_string())
+                }),
+        };
+        if let Err(error) = restored {
+            // Left as it is, for whoever wants to look at it.
+            self.layout_file = None;
+            self.problem(format!("The saved arrangement was not restored ({error})"));
+        }
+    }
+
+    /// Saves the dock's arrangement for next time.
+    fn save(&mut self, ui: &Ui) {
+        let (Some(file), Some(ids)) = (&self.layout_file, self.ids) else {
+            return;
+        };
+        let layout = ui.widget::<DockArea>(ids.dock).and_then(DockArea::layout);
+        let saved = layout.map_or(Ok(()), |layout| config::save(file, &layout.to_string()));
+        if let Err(error) = saved {
+            self.problem(format!("The arrangement was not saved: {error}"));
+        }
+    }
+
+    fn run_query(&mut self, ui: &mut Ui) {
+        let (Some(query), Some(waker)) = (self.query.as_mut(), self.waker.clone()) else {
+            return;
+        };
+        query.run(ui, &self.engine, &mut self.sources, waker);
+        query.show_status(ui);
+    }
+
+    fn show_status(&self, ui: &mut Ui) {
+        let Some(ids) = self.ids else {
+            return;
+        };
+        let loading: Vec<String> = self
+            .sources
+            .iter()
+            .filter(|s| !s.is_done())
+            .map(|s| s.status(ui))
+            .collect();
+        let text = if !self.problems.is_empty() {
+            self.problems.join("   ")
+        } else if !loading.is_empty() {
+            loading.join("   ")
+        } else if !self.note.is_empty() {
+            self.note.clone()
+        } else {
+            let names: Vec<&str> = self.sources.iter().map(|s| s.name.as_str()).collect();
+            match names.len() {
+                0 => "No files open".to_owned(),
+                _ => format!("Tables: {}", names.join(", ")),
+            }
+        };
+        ui.update::<Label, _>(ids.status, |label, cx| label.set_text(cx, text));
+    }
+}
+
+impl App for Studio {
+    fn build(&mut self, ui: &mut Ui, host: &mut Host<'_>) -> Result<(), Box<dyn Error>> {
+        if self.start.light {
+            ui.set_theme(Theme::light());
+        }
+        self.waker = Some(host.waker());
+        let root = ui.root();
+        let bar = Style::row()
+            .padding(8.0)
+            .gap(12.0)
+            .shrink(0.0)
+            .align_items(Align::Center);
+        let toolbar = ui.add(root, Panel::new(), bar)?;
+        ui.add(
+            toolbar,
+            Label::new("densa studio").with_size(15.0),
+            Style::row(),
+        )?;
+        let open =
+            TextInput::new("").with_placeholder("Open a CSV or Parquet file: its path, then Enter");
+        let open = ui.add(toolbar, open, Style::row().grow(1.0))?;
+        let dock = ui.add(root, DockArea::new(), DockArea::style())?;
+        let line = ui.add(root, Panel::new(), Style::row().padding(6.0).shrink(0.0))?;
+        let status = ui.add(line, Label::new("").dim(), Style::row())?;
+        self.ids = Some(Ids { dock, open, status });
+
+        let welcome = DockArea::add_panel(ui, dock, Panel::new(), "Welcome", DockAt::First)?;
+        let body = Style::column().grow(1.0).padding(16.0).gap(10.0);
+        let body = ui.add(welcome, Panel::transparent(), body)?;
+        ui.add(
+            body,
+            Label::new("densa studio").with_size(20.0),
+            Style::row(),
+        )?;
+        ui.add(body, Label::new(WELCOME).wrapping().dim(), Style::row())?;
+        self.welcome = Some(welcome);
+
+        let query = self.start.query.clone().unwrap_or_default();
+        let below = DockAt::Beside(welcome, DockSide::Bottom);
+        let panel = Query::add(ui, dock, below, &query)?;
+        let input = panel.input;
+        self.query = Some(panel);
+        for path in self.start.files.clone() {
+            self.open(ui, &path);
+        }
+        // Without a query of the user's, a look at the first file that opened.
+        if self.start.query.is_none() {
+            if let Some(first) = self.sources.first() {
+                let query = format!("SELECT * FROM {} LIMIT 1000", first.name);
+                ui.update::<TextInput, _>(input, |input, cx| input.set_text(cx, query));
+            }
+        }
+        self.query_pending = self.start.query.is_some() || !self.sources.is_empty();
+        self.restore(ui);
+        ui.set_focus(Some(open));
+        self.show_status(ui);
+        Ok(())
+    }
+
+    fn action(&mut self, ui: &mut Ui, _: &mut Host<'_>, action: Action) {
+        let Some(ids) = self.ids else {
+            return;
+        };
+        let submitted = action.kind == ActionKind::Submitted;
+        if submitted {
+            // The user moved on: what went wrong before is old news.
+            self.problems.clear();
+        }
+        if submitted && action.source == ids.open {
+            let path = ui
+                .widget::<TextInput>(ids.open)
+                .map(|input| input.text().trim().trim_matches('"').to_owned())
+                .unwrap_or_default();
+            if !path.is_empty() {
+                self.open(ui, Path::new(&path));
+                let _ = ui.update::<TextInput, _>(ids.open, |input, cx| input.set_text(cx, ""));
+                self.save(ui);
+            }
+        } else if submitted
+            && self
+                .query
+                .as_ref()
+                .is_some_and(|q| action.source == q.input)
+        {
+            self.query_pending = false;
+            self.run_query(ui);
+        } else if action.source == ids.dock
+            && matches!(action.kind, ActionKind::Changed | ActionKind::Selected(_))
+        {
+            self.save(ui);
+        }
+        self.show_status(ui);
+    }
+
+    fn frame(&mut self, ui: &mut Ui, host: &mut Host<'_>) -> bool {
+        let started = Instant::now();
+        let mut more = false;
+        // The query's result first, so it shows while files load; then the files, taking
+        // turns at going first, each with a share of what is left.
+        if let Some(query) = &mut self.query {
+            more |= query.take(ui, started + QUERY_BUDGET);
+        }
+        let count = self.sources.len();
+        let end = started + FRAME_BUDGET;
+        for turn in 0..count {
+            let index = (self.first_source + turn) % count;
+            let now = Instant::now();
+            let share =
+                end.saturating_duration_since(now) / u32::try_from(count - turn).unwrap_or(1);
+            more |= self.sources[index].take(ui, now + share);
+        }
+        if count > 0 {
+            self.first_source = (self.first_source + 1) % count;
+        }
+        let loading = self.sources.iter().any(|s| !s.is_done());
+        if self.query_pending && !loading {
+            self.query_pending = false;
+            self.run_query(ui);
+        }
+        let running = self.query.as_ref().is_some_and(Query::is_running);
+        if self.status_at.elapsed() >= STATUS_EVERY || !(more || loading || running) {
+            self.status_at = Instant::now();
+            self.show_status(ui);
+            if let Some(query) = &self.query {
+                query.show_status(ui);
+            }
+        }
+        if self.start.close_at.is_some_and(|at| Instant::now() >= at) {
+            host.close();
+            return false;
+        }
+        // Loaders and queries wake the window as rows come; rows left over need another frame.
+        more || self.start.close_at.is_some()
+    }
+}

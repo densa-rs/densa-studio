@@ -18,6 +18,11 @@ const ROW: &str = "row";
 pub(crate) const KEPT_ROWS: u64 = 1_000_000;
 /// How long the rate of rows is counted over.
 const RATE_OVER: Duration = Duration::from_secs(1);
+/// Characters of a skipped message's reason shown, at most: the server writes it.
+const REASON_CHARS: usize = 120;
+/// The largest whole number a float key may hold: past it, floats skip whole numbers, and
+/// two keys could be one.
+const MAX_WHOLE_FLOAT: f64 = 9_007_199_254_740_992.0;
 
 /// How to read a stream: what its URL says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +67,7 @@ impl StreamSpec {
                 _ => {
                     return Err(format!(
                         "unknown stream option {option}: Studio knows key=COLUMN, \
-                         subscribe=TEXT and arrow"
+                         subscribe=TEXT (with & written %26) and arrow"
                     ))
                 }
             }
@@ -70,13 +75,50 @@ impl StreamSpec {
         Ok(spec)
     }
 
-    /// The host and path: what the stream's tab says.
+    /// The host and path, without a user and password or a query: what the stream's tab
+    /// says.
     pub(crate) fn title(&self) -> String {
         let rest = self
             .url
             .split_once("://")
             .map_or(&*self.url, |(_, rest)| rest);
-        rest.split(['?', '#']).next().unwrap_or(rest).to_owned()
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let (host, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
+        // A user and password come before the host's `@`.
+        let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+        match path.is_empty() {
+            true => host.to_owned(),
+            false => format!("{host}/{path}"),
+        }
+    }
+
+    /// What the stream is known by, to find it open again and in a saved arrangement: its
+    /// scheme and host in lower case, its path, and how its rows are keyed and read; not a
+    /// user and password, a query or a subscription, which may hold secrets.
+    pub(crate) fn origin(&self) -> String {
+        let scheme = self
+            .url
+            .split_once("://")
+            .map_or("ws", |(scheme, _)| scheme);
+        let title = self.title();
+        let (host, path) = title.split_once('/').map_or((&*title, ""), |(h, p)| (h, p));
+        let mut origin = format!(
+            "{}://{}/{path}",
+            scheme.to_ascii_lowercase(),
+            host.to_ascii_lowercase()
+        );
+        let mut options = Vec::new();
+        if let Some(key) = &self.key {
+            options.push(format!("key={key}"));
+        }
+        if self.arrow {
+            options.push("arrow".to_owned());
+        }
+        if !options.is_empty() {
+            origin.push('#');
+            origin.push_str(&options.join("&"));
+        }
+        origin
     }
 
     /// What its table is named after: the last part of the path, or the host.
@@ -110,6 +152,9 @@ fn decode(text: &str) -> Option<String> {
     while at < bytes.len() {
         if bytes[at] == b'%' {
             let hex = text.get(at + 1..at + 3)?;
+            if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
             out.push(u8::from_str_radix(hex, 16).ok()?);
             at += 3;
         } else {
@@ -197,7 +242,7 @@ impl Live {
                 StreamEvent::Batch(batch) => return Some(self.ready(batch)),
                 StreamEvent::Invalid { reason, .. } => {
                     self.skipped.0 += 1;
-                    self.skipped.1 = reason;
+                    self.skipped.1 = reason.chars().take(REASON_CHARS).collect();
                 }
                 StreamEvent::Disconnected { reason, retry_in } => {
                     let seconds = retry_in.as_secs_f64();
@@ -252,11 +297,18 @@ impl Live {
     /// messages skipped.
     pub(crate) fn status(&self) -> String {
         let mut text = self.state.clone();
+        // A stream gone quiet: its rate is what has come since.
+        let since = self.counted.0.elapsed();
+        let rate = match since >= 2 * RATE_OVER {
+            // Lossless enough: a rate to show.
+            true => self.counted.1 as f64 / since.as_secs_f64(),
+            false => self.rate,
+        };
         if self.rows > 0 {
             // Lossless enough: a rate to show.
             text.push_str(&format!(
                 ", {} rows/s",
-                crate::source::grouped(self.rate.round() as u64)
+                crate::source::grouped(rate.round() as u64)
             ));
         }
         if self.skipped.0 > 0 {
@@ -308,10 +360,8 @@ fn whole_key(batch: &RecordBatch, key: &str) -> Result<RecordBatch, String> {
             continue;
         }
         let value = floats.value(at);
-        // The largest float below 2^63, so the cast never saturates.
-        let fits = value.fract() == 0.0 && value.abs() < 9.223_372_036_854_775e18;
-        if !fits {
-            return Err(format!("{key} {value} is not a whole number"));
+        if value.fract() != 0.0 || value.abs() > MAX_WHOLE_FLOAT {
+            return Err(format!("{key} {value} is not a whole number up to 2^53"));
         }
         // Lossless: a whole number within i64.
         whole.push(Some(value as i64));
@@ -360,6 +410,32 @@ mod tests {
     }
 
     #[test]
+    fn a_user_and_password_or_a_query_are_neither_shown_nor_kept() {
+        let spec = StreamSpec::parse(
+            "WSS://me:secret@Feed.Example.com:9443/v1/trades?token=t#key=id&arrow&subscribe=s",
+        )
+        .unwrap();
+        assert_eq!(spec.title(), "Feed.Example.com:9443/v1/trades");
+        assert_eq!(spec.name_hint(), "trades");
+        assert_eq!(
+            spec.origin(),
+            "wss://feed.example.com:9443/v1/trades#key=id&arrow"
+        );
+        let bare = StreamSpec::parse("ws://me@host").unwrap();
+        assert_eq!(
+            (bare.title().as_str(), bare.name_hint().as_str()),
+            ("host", "host")
+        );
+        assert_eq!(bare.origin(), "ws://host/");
+        let other_key = StreamSpec::parse("ws://host#key=x").unwrap();
+        assert_ne!(
+            other_key.origin(),
+            bare.origin(),
+            "another key: another source"
+        );
+    }
+
+    #[test]
     fn unknown_or_broken_options_are_named() {
         let error = |text| StreamSpec::parse(text).unwrap_err();
         assert!(error("ws://h/p#keys=a").contains("unknown stream option keys=a"));
@@ -369,6 +445,8 @@ mod tests {
         assert!(error("ws://h/p#key=%G0").contains("not percent-encoded"));
         assert!(error("ws://h/p#key=%E2%82").contains("not percent-encoded"));
         assert!(error("ws://h/p#key=a%2").contains("not percent-encoded"));
+        assert!(error("ws://h/p#key=%+1").contains("not percent-encoded"));
+        assert!(error("ws://h/p#a&b").contains("%26"));
     }
 
     #[test]
@@ -418,8 +496,12 @@ mod tests {
         assert!(whole_key(&rows(vec![("id", fraction)]), "id")
             .unwrap_err()
             .contains("1.5"));
-        let huge: ArrayRef = Arc::new(Float64Array::from(vec![1e19]));
+        let huge: ArrayRef = Arc::new(Float64Array::from(vec![MAX_WHOLE_FLOAT + 2.0]));
         assert!(whole_key(&rows(vec![("id", huge)]), "id").is_err());
+        let largest: ArrayRef = Arc::new(Float64Array::from(vec![-MAX_WHOLE_FLOAT]));
+        assert!(whole_key(&rows(vec![("id", largest)]), "id").is_ok());
+        let nan: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
+        assert!(whole_key(&rows(vec![("id", nan)]), "id").is_err());
         let names: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
         let text = rows(vec![("id", names)]);
         assert_eq!(whole_key(&text, "id").unwrap(), text, "text keys stay");

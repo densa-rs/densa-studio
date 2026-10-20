@@ -56,14 +56,20 @@ pub(crate) struct Query {
     refresh: Option<Refresh>,
     /// The last result's columns, as the query gave them (its table makes them nullable).
     shown: Option<Arc<Schema>>,
+    /// When the last run ended: a live query runs again a while after.
+    ended: Instant,
+    /// A live run failed: run again even if no source changed.
+    retry: bool,
+    /// Sources the query could not see, said after where it stands.
+    unseen: String,
+    /// Rows shown at most ([`MAX_ROWS`]; fewer in tests).
+    max_rows: usize,
 }
 
 /// A run in place of the last one's result: its rows replace those of the same number as
 /// they come, rows past its last are deleted when it ends, and its chart, made aside, takes
 /// the last one's place then.
 struct Refresh {
-    /// Whether its columns are the last result's (until they are known, `false`).
-    same: bool,
     rows: u64,
     chart: Plotted,
 }
@@ -123,6 +129,10 @@ impl Query {
             ran: String::new(),
             refresh: None,
             shown: None,
+            ended: Instant::now(),
+            retry: false,
+            unseen: String::new(),
+            max_rows: MAX_ROWS,
         })
     }
 
@@ -131,18 +141,23 @@ impl Query {
     }
 
     /// Whether the query runs again while its sources change.
+    #[cfg(test)]
     pub(crate) fn is_live(&self) -> bool {
         self.live
     }
 
-    /// Whether a live query should run again: it is not running, a source changed since,
-    /// and it last ran a while ago.
+    /// When a live query should run again: once its last run has been over a while, if it
+    /// is not running and a source changed since (or that run failed); `None` if it need not.
+    pub(crate) fn due_at(&self, changed: bool) -> Option<Instant> {
+        let wanted = self.live && (changed || self.retry);
+        let idle = self.stream.is_none() && !self.ran.is_empty();
+        (wanted && idle).then(|| self.ended + LIVE_EVERY)
+    }
+
+    /// Whether a live query should run again now (see [`due_at`](Self::due_at)).
+    #[cfg(test)]
     pub(crate) fn is_due(&self, changed: bool) -> bool {
-        self.live
-            && changed
-            && self.stream.is_none()
-            && !self.ran.is_empty()
-            && self.started.elapsed() >= LIVE_EVERY
+        self.due_at(changed).is_some_and(|at| Instant::now() >= at)
     }
 
     /// Runs the query in the input over the sources as they are now, replacing the one
@@ -159,6 +174,7 @@ impl Query {
         // Dropping the stream cancels the query running.
         self.stream = None;
         self.refresh = None;
+        self.retry = false;
         let query = match again {
             true => self.ran.clone(),
             false => ui
@@ -168,7 +184,6 @@ impl Query {
         };
         if again {
             self.refresh = Some(Refresh {
-                same: false,
                 rows: 0,
                 chart: Plotted::waiting(),
             });
@@ -178,33 +193,20 @@ impl Query {
             self.state = "Type a query and press Enter".to_owned();
             return;
         }
-        // Sources that changed since the last query: SQL sees their rows as they are now. One
-        // that cannot be registered is named, and the query runs over the others.
-        let mut skipped = Vec::new();
-        for source in sources.iter_mut().filter(|s| s.changed) {
-            let registered = source.snapshot(ui).and_then(|(schema, batches)| {
-                let _ = engine.deregister(&source.name);
-                let registered = engine.register_batches(&source.name, &schema, &batches);
-                registered.map_err(|e| e.to_string())
-            });
-            match registered {
-                Ok(()) => source.changed = false,
-                Err(error) => skipped.push(format!("{} is not queryable ({error})", source.name)),
-            }
-        }
+        let skipped = register(ui, engine, sources);
+        self.unseen = match skipped.is_empty() {
+            true => String::new(),
+            false => format!("; {}", skipped.join(", ")),
+        };
         let stream = engine.sql(query).row_numbers(NUMBER).run(move || {
             waker.wake();
         });
         self.stream = Some(stream);
         self.started = Instant::now();
-        if again {
-            // The last result stays in sight: no word of a run each second.
-            return;
+        if !again {
+            // A run again keeps saying where the last one ended: no word each second.
+            self.state = format!("Running{}", self.unseen);
         }
-        self.state = match skipped.is_empty() {
-            true => "Running".to_owned(),
-            false => format!("Running; {}", skipped.join(", ")),
-        };
     }
 
     /// Takes in what the query has sent, until `deadline`. Whether some is left.
@@ -224,7 +226,7 @@ impl Query {
                 QueryEvent::Batch(batch) => self.rows(ui, batch),
                 QueryEvent::Finished => {
                     let seconds = self.started.elapsed().as_secs_f64();
-                    self.state = format!("Done in {seconds:.2} s");
+                    self.state = format!("Done in {seconds:.2} s{}", self.unseen);
                     self.end(ui);
                 }
                 QueryEvent::Failed { reason } => self.failed(ui, &reason),
@@ -238,8 +240,13 @@ impl Query {
     fn failed(&mut self, ui: &mut Ui, reason: &str) {
         let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
         self.stream = None;
+        self.ended = Instant::now();
         if self.refresh.take().is_some() {
-            self.state = format!("The last run failed: {reason}");
+            // Its rows may have replaced some of the last result's already.
+            self.state = format!(
+                "The last run failed, so rows may be from different runs; it runs again: {reason}"
+            );
+            self.retry = true;
             return;
         }
         let _ = self.replace(ui, waiting());
@@ -253,7 +260,6 @@ impl Query {
     fn columns(&mut self, ui: &mut Ui, schema: Arc<Schema>) {
         if let Some(refresh) = &mut self.refresh {
             if self.shown.as_ref() == Some(&schema) {
-                refresh.same = true;
                 refresh.chart = Plotted::new(&schema, NUMBER);
                 return;
             }
@@ -274,27 +280,34 @@ impl Query {
     /// Rows of the result, into the grid and the chart (the one being made aside, for a
     /// run again).
     fn rows(&mut self, ui: &mut Ui, batch: RecordBatch) {
-        match &mut self.refresh {
-            Some(refresh) => {
-                refresh.rows += batch.num_rows() as u64;
-                if let Err(error) = refresh.chart.add(&batch) {
-                    refresh.chart = Plotted::not_charted(format!("Not charted: {error}"));
-                }
-            }
-            None => self.chart_rows(ui, &batch),
+        if self.refresh.is_none() {
+            self.chart_rows(ui, &batch);
         }
+        let count = batch.num_rows() as u64;
         let mut refused = None;
         let mut rows = 0;
         ui.update::<Grid, _>(self.grid, |grid, cx| {
             let table = grid.model_mut(cx).table_mut();
-            refused = table.upsert(batch).err();
+            refused = table.upsert(batch.clone()).err();
             rows = table.len();
         });
-        if let Some(error) = refused {
+        if let (Some(_), Some(error)) = (&self.refresh, &refused) {
+            // Rows numbered past a gap would leave stale ones behind: the run failed.
+            let reason = format!("rows refused: {error}");
+            return self.failed(ui, &reason);
+        }
+        if let Some(refresh) = &mut self.refresh {
+            refresh.rows += count;
+            if let Err(error) = refresh.chart.add(&batch) {
+                refresh.chart = Plotted::not_charted(format!("Not charted: {error}"));
+            }
+            // This run's rows, not the table's (which holds the last run's too).
+            rows = usize::try_from(refresh.rows).unwrap_or(usize::MAX);
+        } else if let Some(error) = refused {
             self.state = format!("Rows refused: {error}");
         }
-        if rows >= MAX_ROWS {
-            self.state = format!("Cut off at {} rows", grouped(MAX_ROWS as u64));
+        if rows >= self.max_rows {
+            self.state = format!("Cut off at {} rows", grouped(self.max_rows as u64));
             self.end(ui);
         }
     }
@@ -303,6 +316,7 @@ impl Query {
     /// last are deleted, and its chart takes the last one's place.
     fn end(&mut self, ui: &mut Ui) {
         self.stream = None;
+        self.ended = Instant::now();
         match self.refresh.take() {
             Some(refresh) => self.end_refresh(ui, refresh),
             None => self.finish_chart(ui),
@@ -438,6 +452,24 @@ impl Query {
         }
         ui.update::<Label, _>(self.status, |label, cx| label.set_text(cx, text));
     }
+}
+
+/// Gives SQL the rows of `sources` that changed since the last query, as they are now, and
+/// names those it cannot see (which are not tried again until they change again).
+fn register(ui: &Ui, engine: &Engine, sources: &mut [Source]) -> Vec<String> {
+    let mut skipped = Vec::new();
+    for source in sources.iter_mut().filter(|s| s.changed) {
+        let registered = source.snapshot(ui).and_then(|(schema, batches)| {
+            let _ = engine.deregister(&source.name);
+            let registered = engine.register_batches(&source.name, &schema, &batches);
+            registered.map_err(|e| e.to_string())
+        });
+        source.changed = false;
+        if let Err(error) = registered {
+            skipped.push(format!("{} is not queryable ({error})", source.name));
+        }
+    }
+    skipped
 }
 
 /// What the live button says.

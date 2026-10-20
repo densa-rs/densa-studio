@@ -1,7 +1,8 @@
 # densa studio
 
-Open Parquet and CSV files and explore them at once: each file fills a grid of its own while
-it loads, SQL runs over all of them, and the result is charted as it comes. An open-source application built on
+Open Parquet and CSV files and live WebSocket streams and explore them at once: each fills a
+grid of its own as rows come, SQL runs over all of them (again each second, if you like, as
+they change), and the result is charted as it comes. An open-source application built on
 [densa](https://github.com/densa-rs/densa), the Rust toolkit for applications that show a lot
 of live data, and on its [connectors](https://github.com/densa-rs/densa-connectors).
 
@@ -20,8 +21,9 @@ You need Rust 1.94 or later and a GPU with Vulkan, Metal, DirectX 12 or OpenGL.
 ```sh
 cargo install --locked --git https://github.com/densa-rs/densa-studio
 densa-studio trips.parquet zones.csv
-densa-studio --sample        # a million sample web requests, to look around (written to
-                             # your cache folder the first time)
+densa-studio --sample        # a million sample web requests (written to your cache
+                             # folder the first time) and a local stream of 500 sensors
+densa-studio "wss://example.com/trades#key=id"
 ```
 
 Or from a clone: `cargo run --release -- trips.parquet`.
@@ -47,20 +49,32 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   pan (drag), and again once you zoom out to all of it; a few points are drawn as dots.
   Selecting a row in the result marks it on the chart. A result it cannot chart (text
   first) says why above it; rows without a value in the first column are left out.
+- **Live streams.** A `ws://` or `wss://` URL, in the box or on the command line, opens a
+  WebSocket stream in a tab that keeps up as rows come. JSON messages are read with the
+  columns of the first one (numbers as floats, so a fraction that comes later is never cut
+  off); after the URL, options go after `#`, where the server never sees them:
+  `#key=COLUMN` keeps the latest row of each key (without one, every row is kept, numbered
+  in a `row` column, the newest million), `#subscribe=TEXT` sends a message each time the
+  connection opens (percent-encoded: `%7B` for `{`, `%23` for `#`), and `#arrow` reads Arrow
+  IPC instead of JSON, joined with `&`. The status bar shows each stream's connection, rows
+  per second and messages skipped; a lost connection is opened again.
+- **Live SQL.** The Live button beside the query (or `--live`) runs the last query again each
+  second while its sources change: its result is updated in place (the selected row and the
+  sort stay) and the chart moves with it.
 - **A workspace that stays as you left it.** Tabs and panels can be dragged to other groups
   or split beside them, and the arrangement is restored next time (`--fresh` starts from the
   default one). It is saved in your configuration folder: `%APPDATA%\densa-studio` on
   Windows, `~/Library/Application Support/densa-studio` on macOS, `~/.config/densa-studio`
   elsewhere.
 
-Options: `--query SQL` runs a query once the files have loaded, `--light` for the light
-theme, `--seconds N` closes after N seconds.
+Options: `--query SQL` runs a query once the files have loaded, `--live` runs it again as
+sources change, `--light` for the light theme, `--seconds N` closes after N seconds.
 
 ## Next
 
-Live sources (WebSocket streams, Arrow Flight) queried as they change; saving query results;
-opening files by dropping them on the window; bar charts of text categories and picking the
-charted columns without SQL.
+Arrow Flight sources; headers (tokens) for streams; keeping a stream's last minutes rather
+than its newest rows; saving query results; opening files by dropping them on the window; bar
+charts of text categories and picking the charted columns without SQL.
 
 ## License
 

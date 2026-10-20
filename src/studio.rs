@@ -63,6 +63,8 @@ pub(crate) struct Studio {
     /// The source taking rows in first next frame: they take turns.
     first_source: usize,
     status_at: Instant,
+    /// When a thread will wake the window for a live query.
+    wake_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +90,7 @@ impl Studio {
             note: String::new(),
             problems: Vec::new(),
             status_at: Instant::now(),
+            wake_at: None,
         })
     }
 
@@ -113,7 +116,7 @@ impl Studio {
             false => None,
         };
         let origin = match &stream {
-            Some(spec) => Some(spec.url.clone()),
+            Some(spec) => Some(spec.origin()),
             None => std::fs::canonicalize(text)
                 .ok()
                 .map(|p| p.display().to_string()),
@@ -212,6 +215,28 @@ impl Studio {
         };
         query.run(ui, &self.engine, &mut self.sources, waker, again);
         query.show_status(ui);
+    }
+
+    /// Runs a live query again once it is due, or has the window woken then.
+    fn live_query(&mut self, ui: &mut Ui) {
+        let changed = self.sources.iter().any(|s| s.changed);
+        let Some(at) = self.query.as_ref().and_then(|q| q.due_at(changed)) else {
+            return;
+        };
+        if Instant::now() >= at {
+            self.run_query(ui, true);
+            return;
+        }
+        // No frames meanwhile: a thread wakes the window when it is due, once per wait.
+        if self.wake_at != Some(at) {
+            if let Some(waker) = self.waker.clone() {
+                self.wake_at = Some(at);
+                std::thread::spawn(move || {
+                    std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                    waker.wake();
+                });
+            }
+        }
     }
 
     fn show_status(&self, ui: &mut Ui) {
@@ -366,12 +391,7 @@ impl App for Studio {
             self.query_pending = false;
             self.run_query(ui, false);
         }
-        let changed = self.sources.iter().any(|s| s.changed);
-        if self.query.as_ref().is_some_and(|q| q.is_due(changed)) {
-            self.run_query(ui, true);
-        }
-        // A live query waiting for its second to pass needs frames meanwhile.
-        let live = changed && self.query.as_ref().is_some_and(Query::is_live);
+        self.live_query(ui);
         let running = self.query.as_ref().is_some_and(Query::is_running);
         let streaming = self.sources.iter().any(Source::is_live);
         let busy = more || loading || running || streaming;
@@ -387,6 +407,6 @@ impl App for Studio {
             return false;
         }
         // Loaders and queries wake the window as rows come; rows left over need another frame.
-        more || live || self.start.close_at.is_some()
+        more || self.start.close_at.is_some()
     }
 }

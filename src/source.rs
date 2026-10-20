@@ -188,7 +188,7 @@ impl Source {
     ) -> Result<Self, Box<dyn Error>> {
         let live = Live::connect(spec, wake)?;
         let table = LiveTable::new(waiting(live.key()), live.key())?;
-        let origin = spec.url.clone();
+        let origin = spec.origin();
         let (panel, grid) = add_tab(ui, dock, table, spec.title(), &origin, at)?;
         let feed = Feed::Stream {
             live,
@@ -272,31 +272,22 @@ impl Source {
         deleted: Option<arrow_array::UInt64Array>,
     ) {
         let rows = batch.num_rows() as u64;
-        let fresh = match &mut self.feed {
-            Feed::Stream { live, started } if !*started => {
-                *started = true;
-                Some(LiveTable::new(batch.schema(), live.key()))
-            }
-            _ => None,
-        };
-        let mut refused = None;
-        ui.update::<Grid, _>(self.grid, |grid, cx| {
-            let model = grid.model_mut(cx);
-            if let Some(fresh) = fresh {
-                match fresh {
-                    Ok(table) => *model.table_mut() = table,
-                    Err(error) => {
-                        refused = Some(error.to_string());
-                        return;
+        let refused = match self.ready_table(ui, &batch) {
+            Err(error) => Some(error),
+            Ok(()) => {
+                let mut refused = None;
+                ui.update::<Grid, _>(self.grid, |grid, cx| {
+                    let table = grid.model_mut(cx).table_mut();
+                    refused = table.upsert(batch).err().map(|e| e.to_string());
+                    // Numbered rows too old to keep go even when these rows were refused:
+                    // their numbers are never offered again.
+                    if let Some(deleted) = deleted {
+                        let _ = table.delete(&deleted);
                     }
-                }
+                });
+                refused
             }
-            let table = model.table_mut();
-            refused = table.upsert(batch).err().map(|e| e.to_string());
-            if let (None, Some(deleted)) = (&refused, deleted) {
-                refused = table.delete(&deleted).err().map(|e| e.to_string());
-            }
-        });
+        };
         match refused {
             Some(error) => {
                 self.skipped += rows;
@@ -304,6 +295,23 @@ impl Source {
             }
             None => self.changed = true,
         }
+    }
+
+    /// Makes a stream's table from its first rows' columns (again with later rows while it
+    /// cannot be made, the reason given each time).
+    fn ready_table(&mut self, ui: &mut Ui, batch: &RecordBatch) -> Result<(), String> {
+        let Feed::Stream { live, started } = &mut self.feed else {
+            return Ok(());
+        };
+        if *started {
+            return Ok(());
+        }
+        let table = LiveTable::new(batch.schema(), live.key()).map_err(|e| e.to_string())?;
+        ui.update::<Grid, _>(self.grid, |grid, cx| {
+            *grid.model_mut(cx).table_mut() = table
+        });
+        *started = true;
+        Ok(())
     }
 
     /// The rows taken in so far.
@@ -481,7 +489,7 @@ mod tests {
                 ["sensor", "site", "celsius", "humidity", "ok", "time"]
             );
             assert!(source.changed && source.is_live() && !source.is_done());
-            assert_eq!(source.origin, url.split('#').next().unwrap());
+            assert_eq!(source.origin, url);
             let status = source.status(&ui);
             assert!(status.starts_with("readings: connected"), "{status}");
             let (schema, batches) = source.snapshot(&ui).unwrap();
@@ -503,6 +511,58 @@ mod tests {
                 columns(&ui, &source).last().map(String::as_str),
                 Some("row")
             );
+        }
+
+        /// A stream source on a port nothing answers on, fed by hand.
+        fn quiet(key: &str) -> (Ui, Source) {
+            opened(&format!("ws://127.0.0.1:9/quiet{key}"), 0)
+        }
+
+        fn numbered(first: u64, values: &[&str]) -> RecordBatch {
+            let count = values.len() as u64;
+            RecordBatch::try_from_iter([
+                (
+                    "name",
+                    Arc::new(arrow_array::StringArray::from(values.to_vec())) as _,
+                ),
+                (
+                    "row",
+                    Arc::new(arrow_array::UInt64Array::from_iter_values(
+                        first..first + count,
+                    )) as _,
+                ),
+            ])
+            .unwrap()
+        }
+
+        #[test]
+        fn rows_too_old_go_even_when_the_rows_after_them_are_refused() {
+            let (mut ui, mut source) = quiet("");
+            source.upsert(&mut ui, numbered(0, &["a", "b", "c"]), None);
+            assert_eq!(source.rows(&ui), 3);
+            let wrong = RecordBatch::try_from_iter([(
+                "other",
+                Arc::new(arrow_array::StringArray::from(vec!["x"])) as _,
+            )])
+            .unwrap();
+            let too_old = arrow_array::UInt64Array::from(vec![0, 1]);
+            source.upsert(&mut ui, wrong, Some(too_old));
+            assert_eq!(source.rows(&ui), 1, "the old rows went");
+            assert_eq!(source.skipped, 1);
+        }
+
+        #[test]
+        fn rows_that_cannot_make_a_table_leave_the_stream_waiting_for_columns() {
+            let (mut ui, mut source) = quiet("#key=flag");
+            let flags = RecordBatch::try_from_iter([(
+                "flag",
+                Arc::new(arrow_array::BooleanArray::from(vec![true])) as _,
+            )])
+            .unwrap();
+            source.upsert(&mut ui, flags, None);
+            assert!(source.refused.is_some(), "a table is not keyed by booleans");
+            assert!(source.snapshot(&ui).is_err(), "still no rows for SQL");
+            assert!(!source.changed);
         }
 
         #[test]

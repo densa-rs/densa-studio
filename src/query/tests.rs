@@ -232,7 +232,6 @@ fn rows_the_chart_cannot_take_end_it_and_say_why() {
 /// Starts a run again, as `run` does with `again`, without DataFusion.
 fn again(query: &mut Query) {
     query.refresh = Some(Refresh {
-        same: false,
         rows: 0,
         chart: Plotted::waiting(),
     });
@@ -249,7 +248,7 @@ fn a_run_again_updates_the_result_in_place() {
     ui.update::<Grid, _>(query.grid, |grid, cx| grid.select(cx, Some(1)));
     again(&mut query);
     query.columns(&mut ui, rows(0, &[], &[]).schema());
-    assert!(query.refresh.as_ref().unwrap().same);
+    assert!(query.refresh.is_some(), "the same columns: in place");
     query.rows(&mut ui, rows(0, &[11, 21], &[1.0, 2.0]));
     assert_eq!(
         table_len(&ui, &query),
@@ -311,7 +310,7 @@ fn a_failed_run_again_keeps_the_last_result() {
     let (mut ui, mut query) = panel(&[10, 20], &[1.0, 2.0]);
     again(&mut query);
     query.failed(&mut ui, "table   gone");
-    assert_eq!(query.state, "The last run failed: table gone");
+    assert!(query.state.ends_with("it runs again: table gone"), "{}", query.state);
     assert_eq!(table_len(&ui, &query), 2);
     assert_eq!(caption(&ui, &query), "x across; y below");
     query.failed(&mut ui, "bad");
@@ -323,7 +322,7 @@ fn a_failed_run_again_keeps_the_last_result() {
 fn a_live_query_runs_again_when_a_source_changed_a_while_after_its_last_run() {
     let (mut ui, mut query) = panel(&[10], &[1.0]);
     query.ran = "SELECT 1".to_owned();
-    query.started -= LIVE_EVERY;
+    query.ended -= LIVE_EVERY;
     assert!(!query.is_due(true), "not live");
     let click = Action {
         source: query.live_button,
@@ -337,9 +336,9 @@ fn a_live_query_runs_again_when_a_source_changed_a_while_after_its_last_run() {
     );
     assert!(query.is_due(true));
     assert!(!query.is_due(false), "nothing changed");
-    query.started = Instant::now();
+    query.ended = Instant::now();
     assert!(!query.is_due(true), "it ran a moment ago");
-    query.started -= LIVE_EVERY;
+    query.ended -= LIVE_EVERY;
     query.ran.clear();
     assert!(!query.is_due(true), "nothing has run");
     query.action(&mut ui, &click);
@@ -360,4 +359,74 @@ fn a_failed_query_says_so_in_the_chart() {
         .unwrap()
         .x_axis()
         .is_none());
+}
+
+#[test]
+fn a_run_again_after_a_cut_off_result_counts_its_own_rows() {
+    let (mut ui, mut query) = panel(&[1, 2, 3, 4], &[1.0; 4]);
+    query.max_rows = 4;
+    again(&mut query);
+    query.columns(&mut ui, rows(0, &[], &[]).schema());
+    query.rows(&mut ui, rows(0, &[5, 6], &[1.0; 2]));
+    assert!(query.refresh.is_some(), "two rows of four: still running");
+    query.rows(&mut ui, rows(2, &[7], &[1.0]));
+    query.end(&mut ui);
+    assert_eq!(table_len(&ui, &query), 3, "every row of this run kept");
+    again(&mut query);
+    query.columns(&mut ui, rows(0, &[], &[]).schema());
+    query.rows(&mut ui, rows(0, &[1, 2, 3, 4, 5], &[1.0; 5]));
+    assert!(query.refresh.is_none(), "this run reached the most shown");
+    assert!(
+        query.state.starts_with("Cut off at 4 rows"),
+        "{}",
+        query.state
+    );
+}
+
+#[test]
+fn rows_refused_in_a_run_again_fail_it_and_it_runs_again() {
+    let (mut ui, mut query) = panel(&[1, 2], &[1.0; 2]);
+    query.live = true;
+    query.ran = "SELECT 1".to_owned();
+    again(&mut query);
+    query.columns(&mut ui, rows(0, &[], &[]).schema());
+    let unnumbered = RecordBatch::try_from_iter([
+        ("x", Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef),
+        ("y", Arc::new(Float64Array::from(vec![1.0]))),
+        (NUMBER, Arc::new(UInt64Array::from(vec![None]))),
+    ])
+    .unwrap();
+    query.rows(&mut ui, unnumbered);
+    assert!(query.refresh.is_none());
+    assert!(query.state.contains("runs again"), "{}", query.state);
+    query.ended -= LIVE_EVERY;
+    assert!(query.is_due(false), "even with no source changed");
+    assert_eq!(table_len(&ui, &query), 2, "the last result stays");
+}
+
+#[test]
+fn sources_sql_cannot_see_are_named_and_not_tried_until_they_change() {
+    use densa_datafusion::Engine;
+
+    let mut ui = Ui::new(TextSystem::bundled().unwrap());
+    let dock = ui
+        .add(ui.root(), DockArea::new(), DockArea::style())
+        .unwrap();
+    // Nothing answers there: the stream has no rows, so no columns for SQL.
+    let spec = crate::stream::StreamSpec::parse("ws://127.0.0.1:9/quiet").unwrap();
+    let mut source = Source::open_stream(
+        &mut ui,
+        dock,
+        &spec,
+        "quiet".to_owned(),
+        DockAt::First,
+        || {},
+    )
+    .unwrap();
+    source.changed = true;
+    let engine = Engine::new().unwrap();
+    let mut sources = [source];
+    let skipped = register(&ui, &engine, &mut sources);
+    assert_eq!(skipped, ["quiet is not queryable (no rows yet)"]);
+    assert!(!sources[0].changed, "not tried again each second");
 }

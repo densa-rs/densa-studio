@@ -6,7 +6,7 @@ it loads, SQL runs over all of them, and the result is charted as it comes. An o
 of live data, and on its [connectors](https://github.com/densa-rs/densa-connectors).
 
 <p align="center">
-  <img alt="densa studio: a million web requests in a grid, and below it a SQL query grouping them by service and status, with its result" src="https://raw.githubusercontent.com/densa-rs/densa-studio/main/docs/studio.png" width="760">
+  <img alt="densa studio: a million web requests in a grid; below it a SQL query counting errors and the mean time per ten minutes, its result, and a chart of the result with a pane for each" src="https://raw.githubusercontent.com/densa-rs/densa-studio/main/docs/studio.png" width="760">
 </p>
 
 > **Status: 0.1, experimental.** Studio is installed from this repository; it uses densa and
@@ -39,13 +39,14 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   panel runs the query you type with Apache DataFusion and shows the result as it is
   computed; a query sees the files as far as they have loaded. Queries only read.
 - **A chart of the result.** The Chart tab beside the SQL panel puts the result's first
-  column across (a number, date or time) and gives each number column after it a pane of
-  its own, up to four, named in its corner:
+  column across (a number, date or timestamp) and gives each number column after it a pane
+  of its own, up to four, named above it:
   `SELECT date_trunc('minute', time) AS minute, count(*), avg(ms) FROM requests GROUP BY 1`
-  charts requests and their mean time per minute. It fills as the result comes, in order of
-  the first column, and shows all of it until you zoom (wheel) or pan (drag); a double click
-  follows the newest again. Selecting a row in the result marks it on the chart. A result it
-  cannot chart (text first) says why above it.
+  charts requests and their mean time per minute (no `ORDER BY` needed). It fills as the
+  result comes, in order of the first column, and shows all of it until you zoom (wheel) or
+  pan (drag), and again once you zoom out to all of it; a few points are drawn as dots.
+  Selecting a row in the result marks it on the chart. A result it cannot chart (text
+  first) says why above it; rows without a value in the first column are left out.
 - **A workspace that stays as you left it.** Tabs and panels can be dragged to other groups
   or split beside them, and the arrangement is restored next time (`--fresh` starts from the
   default one). It is saved in your configuration folder: `%APPDATA%\densa-studio` on

@@ -71,9 +71,9 @@ impl Query {
         let spec = DockPanel::new("Chart").with_key("chart");
         let right = DockAt::Beside(panel, DockSide::Right);
         let chart_panel = DockArea::add_panel(ui, dock, Panel::new(), spec, right)?;
-        let body = ui.add(chart_panel, Panel::transparent(), Style::column().grow(1.0))?;
-        let line = Style::row().padding(6.0).shrink(0.0);
-        let line = ui.add(body, Panel::transparent(), line)?;
+        let body = Style::column().grow(1.0).padding(6.0).gap(6.0);
+        let body = ui.add(chart_panel, Panel::transparent(), body)?;
+        let line = ui.add(body, Panel::transparent(), Style::row().shrink(0.0))?;
         let waiting = Plotted::waiting();
         let caption = Label::new(waiting.caption()).wrapping().dim();
         let caption = ui.add(line, caption, Style::row().grow(1.0))?;

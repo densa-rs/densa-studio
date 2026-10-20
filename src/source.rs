@@ -1,20 +1,22 @@
-//! A data source: a file read in the background into a live table, shown in a grid of its
-//! own and queryable with SQL by its table name.
+//! A data source: a file read in the background, or a live stream, into a live table shown
+//! in a grid of its own and queryable with SQL by its table name.
 
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use densa_arrow::LiveModel;
 use densa_data::LiveTable;
 use densa_files::{Loader, OpenOptions};
 use densa_ui::{Ui, WidgetId};
 use densa_widgets::{DataGrid, DockArea, DockAt, DockPanel, Panel};
-use densa_window::Waker;
 
-/// The key column every source gets, numbering its rows as they are read (`row_`, `row__`
+use crate::stream::{Arrived, Live, StreamSpec};
+
+/// The key column every file gets, numbering its rows as they are read (`row_`, `row__`
 /// and so on when the file has a column of that name).
 const ROW: &str = "row";
 
@@ -104,39 +106,50 @@ const RESERVED: &[&str] = &[
 
 pub(crate) type Grid = DataGrid<LiveModel>;
 
-/// A file loading (or loaded) into a live table.
+/// Where a source's rows come from.
+enum Feed {
+    /// A file read once, to its end.
+    File {
+        loader: Loader,
+        /// The rows the file says it has, if it says.
+        total: Option<u64>,
+        done: bool,
+        /// Why reading stopped early.
+        failed: Option<String>,
+    },
+    /// A stream that goes on; its table is made when its first rows show its columns.
+    Stream { live: Live, started: bool },
+}
+
+/// A file loading (or loaded), or a stream, in a live table.
 pub(crate) struct Source {
     /// The name SQL knows it by.
     pub(crate) name: String,
-    /// The file, as the system names it (to find it open again).
-    pub(crate) path: PathBuf,
+    /// What it was opened from, as given to find it open again: the file as the system
+    /// names it, or the stream's URL.
+    pub(crate) origin: String,
     /// Its tab in the dock.
     pub(crate) panel: WidgetId,
     pub(crate) grid: WidgetId,
-    loader: Loader,
-    /// The rows the file says it has, if it says.
-    total: Option<u64>,
-    done: bool,
+    feed: Feed,
     /// Rows in batches the table refused, and why the last one was.
     skipped: u64,
     refused: Option<String>,
-    /// Why reading stopped early.
-    failed: Option<String>,
     /// Rows came in since SQL last saw the table.
     pub(crate) changed: bool,
 }
 
 impl Source {
-    /// Opens `path` in a new tab of `dock` placed `at`, named `name` for SQL, and starts
-    /// reading it; `waker` wakes the window as rows arrive. Its tab is keyed by its path, so a
-    /// saved arrangement finds it whatever order files are opened in.
-    pub(crate) fn open(
+    /// Opens the file at `path` in a new tab of `dock` placed `at`, named `name` for SQL,
+    /// and starts reading it, calling `wake` as rows arrive. Its tab is keyed by
+    /// its path, so a saved arrangement finds it whatever order sources are opened in.
+    pub(crate) fn open_file(
         ui: &mut Ui,
         dock: WidgetId,
         path: &Path,
         name: String,
         at: DockAt,
-        waker: Waker,
+        wake: impl Fn() + Send + 'static,
     ) -> Result<Self, Box<dyn Error>> {
         let path = std::fs::canonicalize(path)?;
         // The file's own columns first, to number rows in a column it does not have.
@@ -147,69 +160,150 @@ impl Source {
         }
         let reader = OpenOptions::new().row_numbers(&key).open(&path)?;
         let total = reader.total_rows();
-        let model = LiveModel::new(LiveTable::new(reader.schema(), &key)?)?;
+        let table = LiveTable::new(reader.schema(), &key)?;
         let title = path
             .file_name()
             .map_or_else(|| name.clone(), |f| f.to_string_lossy().into_owned());
-        let spec = DockPanel::new(title).with_key(format!("source:{}", path.display()));
-        let panel = DockArea::add_panel(ui, dock, Panel::new(), spec, at)?;
-        let grid = ui.add(
-            panel,
-            Grid::new(model).with_frozen_columns(1),
-            Grid::style(),
-        )?;
-        let loader = Loader::spawn(reader, move || {
-            waker.wake();
-        })?;
-        Ok(Self {
-            name,
-            path,
-            panel,
-            grid,
+        let origin = path.display().to_string();
+        let (panel, grid) = add_tab(ui, dock, table, title, &origin, at)?;
+        let loader = Loader::spawn(reader, wake)?;
+        let feed = Feed::File {
             loader,
             total,
             done: false,
+            failed: None,
+        };
+        Ok(Self::new(name, origin, panel, grid, feed))
+    }
+
+    /// Opens the stream `spec` in a new tab of `dock` placed `at`, named `name` for SQL, and
+    /// starts reading it, calling `wake` as rows arrive. Its tab is keyed by its URL.
+    pub(crate) fn open_stream(
+        ui: &mut Ui,
+        dock: WidgetId,
+        spec: &StreamSpec,
+        name: String,
+        at: DockAt,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Self, Box<dyn Error>> {
+        let live = Live::connect(spec, wake)?;
+        let table = LiveTable::new(waiting(live.key()), live.key())?;
+        let origin = spec.url.clone();
+        let (panel, grid) = add_tab(ui, dock, table, spec.title(), &origin, at)?;
+        let feed = Feed::Stream {
+            live,
+            started: false,
+        };
+        let mut source = Self::new(name, origin, panel, grid, feed);
+        // Nothing for SQL until its rows show their columns.
+        source.changed = false;
+        Ok(source)
+    }
+
+    fn new(name: String, origin: String, panel: WidgetId, grid: WidgetId, feed: Feed) -> Self {
+        Self {
+            name,
+            origin,
+            panel,
+            grid,
+            feed,
             skipped: 0,
             refused: None,
-            failed: None,
             changed: true,
-        })
+        }
     }
 
-    /// Whether the whole file has been read and taken in.
+    /// Whether the source has all its rows: a file read to its end. A stream never is.
     pub(crate) fn is_done(&self) -> bool {
-        self.done
+        matches!(self.feed, Feed::File { done: true, .. })
     }
 
-    /// Takes in the batches read so far, until `deadline`. Whether some are left.
+    /// Whether rows keep coming: a stream.
+    pub(crate) fn is_live(&self) -> bool {
+        matches!(self.feed, Feed::Stream { .. })
+    }
+
+    /// Takes in the rows read so far, until `deadline`. Whether some are left.
     pub(crate) fn take(&mut self, ui: &mut Ui, deadline: Instant) -> bool {
         while Instant::now() < deadline {
-            let Some(batch) = self.loader.try_next() else {
-                self.done = self.loader.is_finished();
-                return false;
-            };
-            let batch = match batch {
-                Ok(batch) => batch,
-                Err(error) => {
+            let next = match &mut self.feed {
+                Feed::File {
+                    loader,
+                    done,
+                    failed,
+                    ..
+                } => match loader.try_next() {
+                    None => {
+                        *done = loader.is_finished();
+                        return false;
+                    }
                     // Nothing comes after an error.
-                    self.failed = Some(error.to_string());
-                    continue;
-                }
+                    Some(Err(error)) => {
+                        *failed = Some(error.to_string());
+                        continue;
+                    }
+                    Some(Ok(batch)) => Arrived::Rows {
+                        batch,
+                        deleted: None,
+                    },
+                },
+                Feed::Stream { live, .. } => match live.next() {
+                    None => return false,
+                    Some(arrived) => arrived,
+                },
             };
-            let rows = batch.num_rows() as u64;
-            let mut refused = None;
-            ui.update::<Grid, _>(self.grid, |grid, cx| {
-                refused = grid.model_mut(cx).table_mut().upsert(batch).err();
-            });
-            match refused {
-                Some(error) => {
-                    self.skipped += rows;
-                    self.refused = Some(error.to_string());
+            match next {
+                Arrived::Rows { batch, deleted } => self.upsert(ui, batch, deleted),
+                Arrived::Refused { rows, reason } => {
+                    self.skipped += rows as u64;
+                    self.refused = Some(reason);
                 }
-                None => self.changed = true,
             }
         }
         true
+    }
+
+    /// Puts `batch` in the table (making the table, for a stream's first rows), then deletes
+    /// the rows keyed `deleted`.
+    fn upsert(
+        &mut self,
+        ui: &mut Ui,
+        batch: RecordBatch,
+        deleted: Option<arrow_array::UInt64Array>,
+    ) {
+        let rows = batch.num_rows() as u64;
+        let fresh = match &mut self.feed {
+            Feed::Stream { live, started } if !*started => {
+                *started = true;
+                Some(LiveTable::new(batch.schema(), live.key()))
+            }
+            _ => None,
+        };
+        let mut refused = None;
+        ui.update::<Grid, _>(self.grid, |grid, cx| {
+            let model = grid.model_mut(cx);
+            if let Some(fresh) = fresh {
+                match fresh {
+                    Ok(table) => *model.table_mut() = table,
+                    Err(error) => {
+                        refused = Some(error.to_string());
+                        return;
+                    }
+                }
+            }
+            let table = model.table_mut();
+            refused = table.upsert(batch).err().map(|e| e.to_string());
+            if let (None, Some(deleted)) = (&refused, deleted) {
+                refused = table.delete(&deleted).err().map(|e| e.to_string());
+            }
+        });
+        match refused {
+            Some(error) => {
+                self.skipped += rows;
+                self.refused = Some(error);
+            }
+            None => self.changed = true,
+        }
     }
 
     /// The rows taken in so far.
@@ -221,15 +315,22 @@ impl Source {
     /// How the source stands, for the status bar.
     pub(crate) fn status(&self, ui: &Ui) -> String {
         let rows = grouped(self.rows(ui) as u64);
-        let mut text = match (self.done, self.total) {
-            (true, _) => format!("{}: {rows} rows", self.name),
-            (false, Some(total)) => format!("{}: reading, {rows} of {}", self.name, grouped(total)),
-            (false, None) => format!("{}: reading, {rows} rows", self.name),
+        let mut text = match &self.feed {
+            Feed::File { done: true, .. } => format!("{}: {rows} rows", self.name),
+            Feed::File {
+                total: Some(total), ..
+            } => format!("{}: reading, {rows} of {}", self.name, grouped(*total)),
+            Feed::File { .. } => format!("{}: reading, {rows} rows", self.name),
+            Feed::Stream { live, .. } => format!("{}: {}, {rows} rows", self.name, live.status()),
         };
         if let Some(refused) = &self.refused {
             text.push_str(&format!(", {} skipped ({refused})", grouped(self.skipped)));
         }
-        if let Some(failed) = &self.failed {
+        if let Feed::File {
+            failed: Some(failed),
+            ..
+        } = &self.feed
+        {
             text.push_str(&format!(", reading stopped: {failed}"));
         }
         text
@@ -237,11 +338,39 @@ impl Source {
 
     /// The live rows as they are now, for SQL.
     pub(crate) fn snapshot(&self, ui: &Ui) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
+        if let Feed::Stream { started: false, .. } = self.feed {
+            return Err("no rows yet".to_owned());
+        }
         let grid = ui.widget::<Grid>(self.grid).ok_or("its tab is gone")?;
         let table = grid.model().table();
         let batches = table.snapshot().map_err(|e| e.to_string())?;
         Ok((table.schema().clone(), batches))
     }
+}
+
+/// Adds a tab titled `title` showing `table` to `dock`, placed `at`, keyed by `origin`.
+fn add_tab(
+    ui: &mut Ui,
+    dock: WidgetId,
+    table: LiveTable,
+    title: String,
+    origin: &str,
+    at: DockAt,
+) -> Result<(WidgetId, WidgetId), Box<dyn Error>> {
+    let model = LiveModel::new(table)?;
+    let spec = DockPanel::new(title).with_key(format!("source:{origin}"));
+    let panel = DockArea::add_panel(ui, dock, Panel::new(), spec, at)?;
+    let grid = ui.add(
+        panel,
+        Grid::new(model).with_frozen_columns(1),
+        Grid::style(),
+    )?;
+    Ok((panel, grid))
+}
+
+/// A stream's columns before its first rows: its key alone.
+fn waiting(key: &str) -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(key, DataType::Utf8, true)]))
 }
 
 /// A SQL table name for `path`: its file name without the extension, lower case, with
@@ -305,6 +434,93 @@ mod tests {
         let taken = vec!["trips".to_owned(), "trips_2".to_owned()];
         assert_eq!(table_name(Path::new("trips.csv"), &taken), "trips_3");
         assert_eq!(table_name(Path::new("zones.csv"), &taken), "zones");
+    }
+
+    mod streams {
+        use std::time::Duration;
+
+        use densa_paragraph::TextSystem;
+
+        use super::*;
+
+        /// A dock with the stream `url` open in it, once `rows` rows have come (or 10 s).
+        fn opened(url: &str, rows: usize) -> (Ui, Source) {
+            let mut ui = Ui::new(TextSystem::bundled().unwrap());
+            let dock = ui
+                .add(ui.root(), DockArea::new(), DockArea::style())
+                .unwrap();
+            let spec = StreamSpec::parse(url).unwrap();
+            let name = spec.name_hint();
+            let mut source =
+                Source::open_stream(&mut ui, dock, &spec, name, DockAt::First, || {}).unwrap();
+            assert!(!source.changed, "nothing for SQL before rows come");
+            assert!(source.snapshot(&ui).is_err());
+            let until = Instant::now() + Duration::from_secs(10);
+            while source.rows(&ui) < rows && Instant::now() < until {
+                source.take(&mut ui, Instant::now() + Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (ui, source)
+        }
+
+        fn columns(ui: &Ui, source: &Source) -> Vec<String> {
+            let grid = ui.widget::<Grid>(source.grid).unwrap();
+            let schema = grid.model().table().schema().clone();
+            schema.fields().iter().map(|f| f.name().clone()).collect()
+        }
+
+        #[test]
+        fn a_keyed_stream_keeps_the_latest_row_of_each_key() {
+            let url = format!("{}#key=sensor", samples::readings_server().unwrap());
+            let (ui, source) = opened(&url, 400);
+            assert!(source.rows(&ui) >= 400, "{}", source.status(&ui));
+            assert!(source.rows(&ui) <= samples::SENSORS as usize);
+            let columns = columns(&ui, &source);
+            assert_eq!(
+                columns,
+                ["sensor", "site", "celsius", "humidity", "ok", "time"]
+            );
+            assert!(source.changed && source.is_live() && !source.is_done());
+            assert_eq!(source.origin, url.split('#').next().unwrap());
+            let status = source.status(&ui);
+            assert!(status.starts_with("readings: connected"), "{status}");
+            let (schema, batches) = source.snapshot(&ui).unwrap();
+            assert_eq!(schema.fields().len(), 6);
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                source.rows(&ui)
+            );
+        }
+
+        #[test]
+        fn a_stream_without_a_key_numbers_every_row() {
+            let (ui, source) = opened(&samples::readings_server().unwrap(), 1_000);
+            assert!(
+                source.rows(&ui) >= 1_000,
+                "more rows than sensors: every row kept"
+            );
+            assert_eq!(
+                columns(&ui, &source).last().map(String::as_str),
+                Some("row")
+            );
+        }
+
+        #[test]
+        fn a_key_the_rows_lack_refuses_them_and_says_why() {
+            let url = format!("{}#key=missing", samples::readings_server().unwrap());
+            let mut ui_source = opened(&url, 0);
+            let (ui, source) = (&mut ui_source.0, &mut ui_source.1);
+            let until = Instant::now() + Duration::from_secs(10);
+            while source.skipped == 0 && Instant::now() < until {
+                source.take(ui, Instant::now() + Duration::from_millis(20));
+            }
+            assert_eq!(source.rows(ui), 0);
+            assert!(
+                source.status(ui).contains("no column missing"),
+                "{}",
+                source.status(ui)
+            );
+        }
     }
 
     #[test]

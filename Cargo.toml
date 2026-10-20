@@ -29,7 +29,8 @@ densa-widgets = { git = "https://github.com/densa-rs/densa" }
 densa-window = { git = "https://github.com/densa-rs/densa" }
 densa-datafusion = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-files = { git = "https://github.com/densa-rs/densa-connectors" }
-# The connectors' sample web requests, for --sample.
+densa-ws = { git = "https://github.com/densa-rs/densa-connectors" }
+# The connectors' sample web requests and sensor stream, for --sample.
 samples = { git = "https://github.com/densa-rs/densa-connectors" }
 
 [dev-dependencies]

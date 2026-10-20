@@ -2,9 +2,10 @@
 //! the files load, with SQL over all of them and a chart of the result, in a workspace whose
 //! arrangement is kept between runs.
 //!
-//! `densa-studio [FILE...]`, `--sample` to open a million sample web requests, `--query SQL`
-//! to run once the files have loaded, `--light` for the light theme, `--fresh` to ignore the
-//! saved arrangement, `--seconds N` to close after N seconds.
+//! `densa-studio [FILE or ws://URL...]`, `--sample` to open a million sample web requests and
+//! a local stream of sensor readings, `--query SQL` to run once the files have loaded, `--live`
+//! to run it again each second while sources change, `--light` for the light theme, `--fresh`
+//! to ignore the saved arrangement, `--seconds N` to close after N seconds.
 
 mod args;
 mod chart;
@@ -12,6 +13,7 @@ mod config;
 mod query;
 mod sample;
 mod source;
+mod stream;
 mod studio;
 
 use std::error::Error;
@@ -29,15 +31,17 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args = args::parse(&args).map_err(|e| format!("{e}\n{}", args::USAGE))?;
-    let mut files = args.files;
+    let mut sources = args.sources;
     if args.sample {
-        files.push(sample::path(|| {
-            eprintln!("Writing the sample requests (once)...")
-        })?);
+        let requests = sample::path(|| eprintln!("Writing the sample requests (once)..."))?;
+        sources.push(requests.display().to_string());
+        let readings = samples::readings_server()?;
+        sources.push(format!("{readings}#key=sensor"));
     }
     let studio = studio::Studio::new(studio::Start {
-        files,
+        sources,
         query: args.query,
+        live: args.live,
         light: args.light,
         fresh: args.fresh,
         close_at: args

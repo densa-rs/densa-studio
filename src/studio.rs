@@ -13,6 +13,7 @@ use densa_window::{App, Host, Waker};
 use crate::config;
 use crate::query::Query;
 use crate::source::{table_name, Source};
+use crate::stream::StreamSpec;
 
 /// How often the status bar is written again while something loads.
 const STATUS_EVERY: Duration = Duration::from_millis(200);
@@ -21,14 +22,20 @@ const FRAME_BUDGET: Duration = Duration::from_millis(6);
 /// The part of it a query's result gets first, so it shows while files still load.
 const QUERY_BUDGET: Duration = Duration::from_millis(2);
 /// What the welcome tab says.
-const WELCOME: &str = "Open a CSV or Parquet file: type its path in the box above and press \
-                       Enter, or start Studio with paths. Each file opens in a tab of its own \
-                       as it loads, and the SQL panel queries every file by its name.";
+const WELCOME: &str = "Open a CSV or Parquet file, or a WebSocket stream: type its path or \
+                       ws:// URL in the box above and press Enter, or start Studio with them. \
+                       Each opens in a tab of its own that fills as rows come, and the SQL \
+                       panel queries every one by its name. After a stream's URL, #key=COLUMN \
+                       keeps the latest row of each key, #arrow reads Arrow IPC instead of \
+                       JSON, and #subscribe=TEXT sends TEXT when it connects.";
 
 /// What Studio starts with.
 pub(crate) struct Start {
-    pub(crate) files: Vec<PathBuf>,
+    /// Files and stream URLs.
+    pub(crate) sources: Vec<String>,
     pub(crate) query: Option<String>,
+    /// Run the query again each second while sources change.
+    pub(crate) live: bool,
     pub(crate) light: bool,
     /// Ignore the arrangement saved last time.
     pub(crate) fresh: bool,
@@ -92,41 +99,70 @@ impl Studio {
         }
     }
 
-    /// Opens `path` as a new source, in a tab beside the other sources; a file already open
-    /// has its tab shown instead.
-    fn open(&mut self, ui: &mut Ui, path: &Path) {
+    /// Opens `text`, a file's path or a stream's URL, as a new source in a tab beside the
+    /// other sources; one already open has its tab shown instead.
+    fn open(&mut self, ui: &mut Ui, text: &str) {
         let (Some(ids), Some(waker)) = (self.ids, self.waker.clone()) else {
             return;
         };
-        let canonical = std::fs::canonicalize(path).ok();
+        let stream = match StreamSpec::is_stream(text) {
+            true => match StreamSpec::parse(text) {
+                Ok(spec) => Some(spec),
+                Err(error) => return self.problem(format!("{text} not opened: {error}")),
+            },
+            false => None,
+        };
+        let origin = match &stream {
+            Some(spec) => Some(spec.url.clone()),
+            None => std::fs::canonicalize(text)
+                .ok()
+                .map(|p| p.display().to_string()),
+        };
         if let Some(open) = self
             .sources
             .iter()
-            .find(|s| Some(&s.path) == canonical.as_ref())
+            .find(|s| Some(&s.origin) == origin.as_ref())
         {
             let _ = DockArea::show_panel(ui, ids.dock, open.panel);
             self.note = format!("Already open as {}", open.name);
             return;
         }
         let taken: Vec<String> = self.sources.iter().map(|s| s.name.clone()).collect();
-        let name = table_name(path, &taken);
         let at = match (self.sources.first(), self.welcome, &self.query) {
             (Some(first), _, _) => DockAt::With(first.panel),
             (None, Some(welcome), _) => DockAt::With(welcome),
             (None, None, Some(query)) => DockAt::Beside(query.panel, DockSide::Top),
             (None, None, None) => DockAt::First,
         };
-        match Source::open(ui, ids.dock, path, name, at, waker) {
-            Ok(source) => {
+        let wake = move || {
+            waker.wake();
+        };
+        let (opened, what) = match &stream {
+            Some(spec) => {
+                let name = table_name(Path::new(&spec.name_hint()), &taken);
+                (
+                    Source::open_stream(ui, ids.dock, spec, name, at, wake),
+                    spec.title(),
+                )
+            }
+            None => {
+                let path = Path::new(text);
+                let name = table_name(path, &taken);
                 let file = path.file_name().unwrap_or(path.as_os_str());
-                self.note = format!("Opened {} as {}", file.to_string_lossy(), source.name);
+                let file = file.to_string_lossy().into_owned();
+                (Source::open_file(ui, ids.dock, path, name, at, wake), file)
+            }
+        };
+        match opened {
+            Ok(source) => {
+                self.note = format!("Opened {what} as {}", source.name);
                 let _ = DockArea::show_panel(ui, ids.dock, source.panel);
                 self.sources.push(source);
                 if let Some(welcome) = self.welcome.take() {
                     let _ = DockArea::remove_panel(ui, ids.dock, welcome);
                 }
             }
-            Err(error) => self.problem(format!("{} not opened: {error}", path.display())),
+            Err(error) => self.problem(format!("{text} not opened: {error}")),
         }
     }
 
@@ -168,11 +204,13 @@ impl Studio {
         }
     }
 
-    fn run_query(&mut self, ui: &mut Ui) {
+    /// Runs the query in the SQL panel; `again` runs the last one again, updating its result
+    /// in place.
+    fn run_query(&mut self, ui: &mut Ui, again: bool) {
         let (Some(query), Some(waker)) = (self.query.as_mut(), self.waker.clone()) else {
             return;
         };
-        query.run(ui, &self.engine, &mut self.sources, waker);
+        query.run(ui, &self.engine, &mut self.sources, waker, again);
         query.show_status(ui);
     }
 
@@ -180,6 +218,7 @@ impl Studio {
         let Some(ids) = self.ids else {
             return;
         };
+        // Files still loading, and every stream: how they stand is news.
         let loading: Vec<String> = self
             .sources
             .iter()
@@ -221,8 +260,9 @@ impl App for Studio {
             Label::new("densa studio").with_size(15.0),
             Style::row(),
         )?;
-        let open =
-            TextInput::new("").with_placeholder("Open a CSV or Parquet file: its path, then Enter");
+        let open = TextInput::new("").with_placeholder(
+            "Open a CSV or Parquet file or a ws:// stream: its path or URL, then Enter",
+        );
         let open = ui.add(toolbar, open, Style::row().grow(1.0))?;
         let dock = ui.add(root, DockArea::new(), DockArea::style())?;
         let line = ui.add(root, Panel::new(), Style::row().padding(6.0).shrink(0.0))?;
@@ -242,11 +282,11 @@ impl App for Studio {
 
         let query = self.start.query.clone().unwrap_or_default();
         let below = DockAt::Beside(welcome, DockSide::Bottom);
-        let panel = Query::add(ui, dock, below, &query)?;
+        let panel = Query::add(ui, dock, below, &query, self.start.live)?;
         let input = panel.input;
         self.query = Some(panel);
-        for path in self.start.files.clone() {
-            self.open(ui, &path);
+        for source in self.start.sources.clone() {
+            self.open(ui, &source);
         }
         // Without a query of the user's, a look at the first file that opened.
         if self.start.query.is_none() {
@@ -275,12 +315,12 @@ impl App for Studio {
             self.problems.clear();
         }
         if submitted && action.source == ids.open {
-            let path = ui
+            let text = ui
                 .widget::<TextInput>(ids.open)
                 .map(|input| input.text().trim().trim_matches('"').to_owned())
                 .unwrap_or_default();
-            if !path.is_empty() {
-                self.open(ui, Path::new(&path));
+            if !text.is_empty() {
+                self.open(ui, &text);
                 let _ = ui.update::<TextInput, _>(ids.open, |input, cx| input.set_text(cx, ""));
                 self.save(ui);
             }
@@ -291,7 +331,7 @@ impl App for Studio {
                 .is_some_and(|q| action.source == q.input)
         {
             self.query_pending = false;
-            self.run_query(ui);
+            self.run_query(ui, false);
         } else if action.source == ids.dock
             && matches!(action.kind, ActionKind::Changed | ActionKind::Selected(_))
         {
@@ -320,13 +360,22 @@ impl App for Studio {
         if count > 0 {
             self.first_source = (self.first_source + 1) % count;
         }
-        let loading = self.sources.iter().any(|s| !s.is_done());
+        // Streams never finish: the first query waits for the files alone.
+        let loading = self.sources.iter().any(|s| !s.is_done() && !s.is_live());
         if self.query_pending && !loading {
             self.query_pending = false;
-            self.run_query(ui);
+            self.run_query(ui, false);
         }
+        let changed = self.sources.iter().any(|s| s.changed);
+        if self.query.as_ref().is_some_and(|q| q.is_due(changed)) {
+            self.run_query(ui, true);
+        }
+        // A live query waiting for its second to pass needs frames meanwhile.
+        let live = changed && self.query.as_ref().is_some_and(Query::is_live);
         let running = self.query.as_ref().is_some_and(Query::is_running);
-        if self.status_at.elapsed() >= STATUS_EVERY || !(more || loading || running) {
+        let streaming = self.sources.iter().any(Source::is_live);
+        let busy = more || loading || running || streaming;
+        if self.status_at.elapsed() >= STATUS_EVERY || !busy {
             self.status_at = Instant::now();
             self.show_status(ui);
             if let Some(query) = &self.query {
@@ -338,6 +387,6 @@ impl App for Studio {
             return false;
         }
         // Loaders and queries wake the window as rows come; rows left over need another frame.
-        more || self.start.close_at.is_some()
+        more || live || self.start.close_at.is_some()
     }
 }

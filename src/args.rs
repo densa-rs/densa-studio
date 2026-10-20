@@ -1,14 +1,15 @@
 //! The command line.
 
-use std::path::PathBuf;
-
 /// What the command line asks for.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Args {
-    /// Files to open, in order.
-    pub(crate) files: Vec<PathBuf>,
-    /// Write the sample requests to a Parquet file and open it.
+    /// Files and stream URLs to open, in order.
+    pub(crate) sources: Vec<String>,
+    /// Write the sample requests to a Parquet file and open it, and a local stream of
+    /// sensor readings.
     pub(crate) sample: bool,
+    /// Run the query again each second while sources change.
+    pub(crate) live: bool,
     pub(crate) light: bool,
     /// Start with the default arrangement, not the one saved last time.
     pub(crate) fresh: bool,
@@ -16,8 +17,8 @@ pub(crate) struct Args {
     pub(crate) seconds: Option<u64>,
 }
 
-pub(crate) const USAGE: &str = "usage: densa-studio [FILE...] [--sample] [--query SQL] \
-                                [--light] [--fresh] [--seconds N]";
+pub(crate) const USAGE: &str = "usage: densa-studio [FILE or ws://URL...] [--sample] \
+                                [--query SQL] [--live] [--light] [--fresh] [--seconds N]";
 
 /// Reads `args` (without the program's name).
 pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
@@ -32,6 +33,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
     while at < args.len() {
         match args[at].as_str() {
             "--sample" => parsed.sample = true,
+            "--live" => parsed.live = true,
             "--light" => parsed.light = true,
             "--fresh" => parsed.fresh = true,
             "--query" => {
@@ -44,7 +46,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
                 at += 1;
             }
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
-            path => parsed.files.push(PathBuf::from(path)),
+            source => parsed.sources.push(source.to_owned()),
         }
         at += 1;
     }
@@ -61,12 +63,18 @@ mod tests {
 
     #[test]
     fn files_and_flags_in_any_order() {
-        let parsed = args(&["a.parquet", "--light", "b.csv", "--seconds", "5", "--fresh"]).unwrap();
-        assert_eq!(
-            parsed.files,
-            [PathBuf::from("a.parquet"), PathBuf::from("b.csv")]
-        );
-        assert!(parsed.light && parsed.fresh && !parsed.sample);
+        let parsed = args(&[
+            "a.parquet",
+            "--light",
+            "ws://h/p#key=id",
+            "--seconds",
+            "5",
+            "--fresh",
+            "--live",
+        ])
+        .unwrap();
+        assert_eq!(parsed.sources, ["a.parquet", "ws://h/p#key=id"]);
+        assert!(parsed.light && parsed.fresh && parsed.live && !parsed.sample);
         assert_eq!(parsed.seconds, Some(5));
     }
 

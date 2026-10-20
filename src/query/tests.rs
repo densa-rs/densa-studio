@@ -310,7 +310,11 @@ fn a_failed_run_again_keeps_the_last_result() {
     let (mut ui, mut query) = panel(&[10, 20], &[1.0, 2.0]);
     again(&mut query);
     query.failed(&mut ui, "table   gone");
-    assert!(query.state.ends_with("it runs again: table gone"), "{}", query.state);
+    assert!(
+        query.state.ends_with("it runs again: table gone"),
+        "{}",
+        query.state
+    );
     assert_eq!(table_len(&ui, &query), 2);
     assert_eq!(caption(&ui, &query), "x across; y below");
     query.failed(&mut ui, "bad");

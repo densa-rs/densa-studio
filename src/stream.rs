@@ -479,6 +479,60 @@ mod tests {
         assert_eq!(gone.values(), &[2, 3, 4]);
     }
 
+    /// A stream on a port nothing answers on.
+    fn quiet(options: &str) -> Live {
+        let spec = StreamSpec::parse(&format!("ws://127.0.0.1:9/quiet{options}")).unwrap();
+        Live::connect(&spec, || {}).unwrap()
+    }
+
+    #[test]
+    fn numbers_take_a_name_the_rows_do_not_have() {
+        let mut live = quiet("");
+        assert_eq!(live.key(), "row");
+        let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let Arrived::Rows { batch, deleted } = live.ready(rows(vec![("row", names)])) else {
+            panic!("refused");
+        };
+        assert_eq!(live.key(), "row_");
+        assert_eq!(batch.schema().field(1).name(), "row_");
+        assert!(deleted.is_none());
+        assert_eq!(live.rows, 2);
+        let keyed = quiet("#key=row");
+        assert_eq!(keyed.key(), "row", "a key is the rows' own");
+    }
+
+    #[test]
+    fn the_status_says_how_the_stream_stands() {
+        let mut live = quiet("");
+        assert_eq!(
+            live.status(),
+            "connecting",
+            "no rate before rows, nothing skipped"
+        );
+        live.count(5);
+        assert_eq!(live.rate, 0.0, "no rate until a second has passed");
+        live.counted.0 -= RATE_OVER;
+        live.count(5);
+        assert!(live.rate > 5.0 && live.rate <= 10.0, "{}", live.rate);
+        assert!(
+            live.status().starts_with("connecting, 10 rows/s"),
+            "{}",
+            live.status()
+        );
+        live.skipped = (2, "bad".to_owned());
+        assert!(
+            live.status().ends_with(", 2 messages skipped (bad)"),
+            "{}",
+            live.status()
+        );
+        live.counted.0 -= 2 * RATE_OVER;
+        assert!(
+            live.status().starts_with("connecting, 0 rows/s"),
+            "a quiet stream: {}",
+            live.status()
+        );
+    }
+
     #[test]
     fn a_key_of_floats_becomes_whole_numbers() {
         let ids: ArrayRef = Arc::new(Float64Array::from(vec![Some(3.0), None, Some(-7.0)]));

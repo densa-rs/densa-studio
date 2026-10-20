@@ -7,7 +7,7 @@ they change), and the result is charted as it comes. An open-source application 
 of live data, and on its [connectors](https://github.com/densa-rs/densa-connectors).
 
 <p align="center">
-  <img alt="densa studio: a million web requests in a grid; below it a SQL query counting errors and the mean time per ten minutes, its result, and a chart of the result with a pane for each" src="https://raw.githubusercontent.com/densa-rs/densa-studio/main/docs/studio.png" width="760">
+  <img alt="densa studio: a live stream of 500 sensors in a grid; below it a live SQL query counting the sensors at each temperature, its result, and a chart of it, all updating each second" src="https://raw.githubusercontent.com/densa-rs/densa-studio/main/docs/studio.png" width="760">
 </p>
 
 > **Status: 0.1, experimental.** Studio is installed from this repository; it uses densa and

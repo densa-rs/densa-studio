@@ -1,6 +1,6 @@
 //! densa studio: open Parquet and CSV files and explore them at once, in grids that fill as
-//! the files load and with SQL over all of them, in a workspace whose arrangement is kept
-//! between runs.
+//! the files load, with SQL over all of them and a chart of the result, in a workspace whose
+//! arrangement is kept between runs.
 //!
 //! `densa-studio [FILE...]`, `--sample` to open a million sample web requests, `--query SQL`
 //! to run once the files have loaded, `--light` for the light theme, `--fresh` to ignore the

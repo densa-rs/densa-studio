@@ -264,6 +264,8 @@ mod tests {
     use arrow_array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampSecondArray};
     use arrow_array::{Date32Array, UInt64Array};
     use arrow_schema::{Field, Schema};
+    use densa_draw::{Instance, InstanceBuffer};
+    use densa_text::{AtlasConfig, GlyphCache};
 
     use super::*;
 
@@ -401,6 +403,82 @@ mod tests {
         assert_eq!(chart.mark_row(Some(99)), None, "no such row");
         let mut waiting = Plotted::waiting();
         assert_eq!(waiting.mark_row(Some(0)), None);
+    }
+
+    /// What pane 0 of `chart` draws across 0..`x_end` on a 400 x 200 plot.
+    fn drawn(chart: &Plotted, x_end: f64) -> Vec<Instance> {
+        let mut cache = GlyphCache::new(AtlasConfig::default());
+        let mut out = InstanceBuffer::with_capacity(65_536);
+        let mut canvas = Canvas::begin(&mut cache, &mut out);
+        let plot = Plot::new(
+            Rect::new(0.0, 0.0, 400.0, 200.0),
+            Axis::number(0.0, x_end),
+            Axis::number(0.0, 10.0),
+        );
+        chart.paint(0, &plot, &mut canvas, &palette());
+        out.as_slice().to_vec()
+    }
+
+    fn palette() -> ChartPalette {
+        ChartPalette::new()
+    }
+
+    /// The squares drawn `DOT` wide.
+    fn dots(instances: &[Instance]) -> usize {
+        instances
+            .iter()
+            .filter(|i| i.rect[2] == DOT && i.rect[3] == DOT)
+            .count()
+    }
+
+    #[test]
+    fn a_few_points_are_dots_on_a_line_and_many_a_line_alone() {
+        let few = chart_of(vec![("x", ints(&[1, 2, 3])), ("y", ints(&[2, 5, 8]))]);
+        let drawn_few = drawn(&few, 4.0);
+        assert_eq!(dots(&drawn_few), 3);
+        assert!(drawn_few.len() > 3, "and a line");
+
+        let x: Vec<i64> = (0..300).collect();
+        let y: Vec<i64> = x.iter().map(|x| x % 7).collect();
+        let many = chart_of(vec![("x", ints(&x)), ("y", ints(&y))]);
+        assert_eq!(dots(&drawn(&many, 300.0)), 0, "300 points in sight");
+        assert_eq!(dots(&drawn(&many, 150.0)), 151, "fewer in sight: 0 to 150");
+
+        let off = chart_of(vec![("x", ints(&[1, 2])), ("y", ints(&[50, 5]))]);
+        assert_eq!(
+            dots(&drawn(&off, 4.0)),
+            1,
+            "a point above the plot has no dot"
+        );
+    }
+
+    #[test]
+    fn the_marked_row_is_a_band_across_every_pane() {
+        let band = |instances: &[Instance]| {
+            let color = palette().line.with_alpha(0.3).to_array();
+            instances
+                .iter()
+                .filter(|i| i.color == color && i.rect[3] == 200.0)
+                .map(|i| i.rect)
+                .collect::<Vec<_>>()
+        };
+        let mut chart = chart_of(vec![("x", ints(&[1, 2, 3])), ("y", ints(&[2, 5, 8]))]);
+        assert!(band(&drawn(&chart, 4.0)).is_empty());
+        chart.mark_row(Some(1));
+        assert_eq!(
+            band(&drawn(&chart, 4.0)),
+            [[199.0, 0.0, 3.0, 200.0]],
+            "x 2 of 0..4"
+        );
+        assert!(band(&drawn(&chart, 1.5)).is_empty(), "out of sight");
+
+        let mut waiting = Plotted::waiting();
+        waiting.mark = Some(1.0);
+        assert_eq!(
+            band(&drawn(&waiting, 4.0)).len(),
+            1,
+            "drawn before any series"
+        );
     }
 
     #[test]

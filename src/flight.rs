@@ -12,7 +12,7 @@ use densa_flight::{FlightEvent, FlightOptions, FlightStream};
 use crate::stream::{
     encode, header, header_value, option_text, options, parts, shortened, Arrived, Keying,
 };
-use crate::window::{TimeWindow, WindowOptions};
+use crate::time::{TimeOptions, TimeSpec};
 
 /// A failed read that may pass is tried again after this, then twice as long, up to
 /// [`RETRY_MOST`].
@@ -46,8 +46,8 @@ pub(crate) struct FlightSpec {
     pub(crate) headers: Vec<(String, String)>,
     /// The table name asked for.
     pub(crate) name: Option<String>,
-    /// The rows kept by their time, if a window is given.
-    pub(crate) window: Option<TimeWindow>,
+    /// The column of the rows' times, and the window kept over it, if given.
+    pub(crate) time: Option<TimeSpec>,
 }
 
 impl fmt::Debug for FlightSpec {
@@ -59,7 +59,7 @@ impl fmt::Debug for FlightSpec {
             .field("key", &self.key)
             .field("headers", &headers)
             .field("name", &self.name)
-            .field("window", &self.window)
+            .field("time", &self.time)
             .finish()
     }
 }
@@ -93,12 +93,12 @@ impl FlightSpec {
             key: None,
             headers: Vec::new(),
             name: None,
-            window: None,
+            time: None,
         };
         let mut asked = None;
-        let mut window = WindowOptions::default();
+        let mut time = TimeOptions::default();
         for (option, value) in options {
-            if window.take(&option, &value)? {
+            if time.take(&option, &value)? {
                 continue;
             }
             if value.is_empty() {
@@ -115,7 +115,7 @@ impl FlightSpec {
         if matches!(&spec.request, Request::Path(parts) if parts.is_empty()) {
             return Err("path= names a dataset: path=A/B".to_owned());
         }
-        spec.window = window.finish()?;
+        spec.time = time.finish(spec.key.as_deref())?;
         Ok(spec)
     }
 
@@ -142,7 +142,7 @@ impl FlightSpec {
                     "unknown Flight option {}: Studio knows sql=QUERY, path=A/B, ticket=T, \
                      key=COLUMN, header=NAME:VALUE, name=TABLE and {}",
                     option_text(option, &value),
-                    WindowOptions::KNOWN
+                    TimeOptions::KNOWN
                 ))
             }
         };
@@ -197,7 +197,7 @@ impl FlightSpec {
         if let Some(name) = &self.name {
             origin.push_str(&format!("&name={}", encode(name)));
         }
-        for option in self.window.iter().flat_map(TimeWindow::options) {
+        for option in self.time.iter().flat_map(TimeSpec::options) {
             origin.push('&');
             origin.push_str(&option);
         }
@@ -377,18 +377,21 @@ mod tests {
     }
 
     #[test]
-    fn a_window_is_part_of_what_a_flight_source_is_known_by() {
+    fn a_time_column_is_part_of_what_a_flight_source_is_known_by() {
         let spec = FlightSpec::parse("grpc://h#path=a&time=t&window=1h").unwrap();
-        assert_eq!(spec.window.as_ref().unwrap().span.as_secs(), 3_600);
+        let window = spec.time.as_ref().unwrap().window;
+        assert_eq!(window, Some(Duration::from_secs(3_600)));
         assert_eq!(spec.origin(), "grpc://h#path=a&time=t&window=1h");
-        assert!(format!("{spec:?}").contains("window: Some"));
-        let error = FlightSpec::parse("grpc://h#path=a&time=t").unwrap_err();
-        assert!(error.contains("window=10m"), "{error}");
+        assert!(format!("{spec:?}").contains("time: Some"));
+        let error = FlightSpec::parse("grpc://h#path=a&window=1h").unwrap_err();
+        assert!(error.contains("time=COLUMN"), "{error}");
+        let error = FlightSpec::parse("grpc://h#path=a&key=t&time=t").unwrap_err();
+        assert!(error.contains("a key cannot be a time"), "{error}");
         let error = FlightSpec::parse("grpc://h#path=a&time=").unwrap_err();
         assert_eq!(error, "time needs a value");
         let error = FlightSpec::parse("grpc://h#path=a&later=1").unwrap_err();
         assert!(
-            error.ends_with("and time=COLUMN, window=10m and unit=s"),
+            error.ends_with("and time=COLUMN, unit=s and window=10m"),
             "{error}"
         );
     }

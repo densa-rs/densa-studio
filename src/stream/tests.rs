@@ -169,17 +169,22 @@ fn a_stream_can_name_its_table() {
 }
 
 #[test]
-fn a_window_is_part_of_what_a_stream_is_known_by() {
+fn a_time_column_is_part_of_what_a_stream_is_known_by() {
     let spec = StreamSpec::parse("ws://h/p#key=id&time=at&window=10m&unit=s").unwrap();
-    let window = spec.window.as_ref().unwrap();
-    assert_eq!((window.column.as_str(), window.span.as_secs()), ("at", 600));
+    let time = spec.time.as_ref().unwrap();
+    assert_eq!(time.column, "at");
+    assert_eq!(time.window, Some(Duration::from_secs(600)));
     assert_eq!(spec.origin(), "ws://h/p#key=id&time=at&window=10m&unit=s");
-    assert!(format!("{spec:?}").contains("window: Some"));
+    assert!(format!("{spec:?}").contains("time: Some"));
+    let alone = StreamSpec::parse("ws://h/p#time=at").unwrap();
+    assert_eq!(alone.origin(), "ws://h/p#time=at");
+    let keyed = StreamSpec::parse("ws://h/p#key=at&time=at").unwrap_err();
+    assert!(keyed.contains("a key cannot be a time"), "{keyed}");
     let error = StreamSpec::parse("ws://h/p#window=10m").unwrap_err();
     assert!(error.contains("time=COLUMN"), "{error}");
     let error = StreamSpec::parse("ws://h/p#later").unwrap_err();
     assert!(
-        error.ends_with("name=TABLE and time=COLUMN, window=10m and unit=s"),
+        error.ends_with("name=TABLE and time=COLUMN, unit=s and window=10m"),
         "{error}"
     );
 }

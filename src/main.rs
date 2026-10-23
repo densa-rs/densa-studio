@@ -16,7 +16,7 @@ mod sample;
 mod source;
 mod stream;
 mod studio;
-mod window;
+mod time;
 
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -41,7 +41,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         // Every reading of the last minute, then each sensor's latest (in front, as its
         // values change in place).
         sources.push(format!("{readings}#time=time&window=1m&name=recent"));
-        sources.push(format!("{readings}#key=sensor"));
+        sources.push(format!("{readings}#key=sensor&time=time"));
     }
     let studio = studio::Studio::new(studio::Start {
         sources,

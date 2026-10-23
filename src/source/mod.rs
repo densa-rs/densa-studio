@@ -17,7 +17,7 @@ use densa_widgets::{DataGrid, DockArea, DockAt, DockPanel, Panel};
 
 use crate::flight::{Fetch, FlightSpec};
 use crate::stream::{Arrived, Live, StreamSpec};
-use crate::window::TimeWindow;
+use crate::time::TimeSpec;
 
 /// The key column every file gets, numbering its rows as they are read (`row_`, `row__`
 /// and so on when the file has a column of that name).
@@ -138,9 +138,12 @@ pub(crate) struct Source {
     pub(crate) panel: WidgetId,
     pub(crate) grid: WidgetId,
     feed: Feed,
-    /// The rows kept by their time, for a remote source with a window.
-    window: Option<TimeWindow>,
-    /// Why the window could not keep the table, if it could not: the rows come all the same.
+    /// The column of the rows' times, made timestamps as rows arrive, and the window kept
+    /// over it: for a remote source that names one.
+    time: Option<TimeSpec>,
+    /// What went wrong with the last batch's times, if anything: the rows come all the same.
+    time_off: Option<String>,
+    /// Why the window could not keep the table, if it could not.
     window_off: Option<String>,
     /// Rows in batches the table refused, and why the last one was.
     skipped: u64,
@@ -205,7 +208,7 @@ impl Source {
             started: false,
         };
         let mut source = Self::new(name, origin, panel, grid, feed);
-        source.window = spec.window.clone();
+        source.time = spec.time.clone();
         // Nothing for SQL until its rows show their columns.
         source.changed = false;
         Ok(source)
@@ -231,7 +234,7 @@ impl Source {
             started: false,
         };
         let mut source = Self::new(name, origin, panel, grid, feed);
-        source.window = spec.window.clone();
+        source.time = spec.time.clone();
         // Nothing for SQL until its columns come.
         source.changed = false;
         Ok(source)
@@ -244,7 +247,8 @@ impl Source {
             panel,
             grid,
             feed,
-            window: None,
+            time: None,
+            time_off: None,
             window_off: None,
             skipped: 0,
             refused: None,
@@ -300,6 +304,7 @@ impl Source {
                     Some(arrived) => arrived,
                 },
             };
+            let next = self.timed(next);
             match next {
                 Arrived::Columns(columns) => self.start_table(ui, &columns),
                 Arrived::Rows { batch, deleted } => self.upsert(ui, batch, deleted),
@@ -310,6 +315,27 @@ impl Source {
             }
         }
         true
+    }
+
+    /// `arrived` with its time column made timestamps, if the source names one; what went
+    /// wrong is kept for the status bar.
+    fn timed(&mut self, arrived: Arrived) -> Arrived {
+        let Some(time) = &self.time else {
+            return arrived;
+        };
+        let mut convert = |batch| {
+            let (batch, problem) = time.convert(batch);
+            self.time_off = problem;
+            batch
+        };
+        match arrived {
+            Arrived::Columns(columns) => Arrived::Columns(convert(columns)),
+            Arrived::Rows { batch, deleted } => Arrived::Rows {
+                batch: convert(batch),
+                deleted,
+            },
+            refused @ Arrived::Refused { .. } => refused,
+        }
     }
 
     /// Puts `batch` in the table (making the table, for a stream's first rows), then deletes
@@ -358,10 +384,10 @@ impl Source {
             return Ok(());
         }
         let mut table = LiveTable::new(batch.schema(), key).map_err(|e| e.to_string())?;
-        if let Some(window) = &self.window {
+        if let Some(time) = &self.time {
             // A window that cannot apply now never will (the columns are settled): the rows
             // are shown without it, and the status bar says why.
-            self.window_off = window.apply(&mut table).err();
+            self.window_off = time.apply(&mut table).err();
         }
         ui.update::<Grid, _>(self.grid, |grid, cx| {
             *grid.model_mut(cx).table_mut() = table
@@ -382,6 +408,7 @@ impl Source {
         // What was said of the last try is old news.
         self.skipped = 0;
         self.refused = None;
+        self.window_off = None;
         if let Err(error) = self.ready_table(ui, columns) {
             // The last try's rows go all the same: a table of the key alone, until columns
             // that can make one come.
@@ -425,10 +452,20 @@ impl Source {
                 format!("{}: {}, {rows} rows", self.name, fetch.status())
             }
         };
-        match (&self.window, &self.window_off) {
-            (Some(_), Some(off)) => text.push_str(&format!(" (window off: {off})")),
-            (Some(window), None) => text.push_str(&format!(" ({})", window.describe())),
-            (None, _) => {}
+        let mut notes = Vec::new();
+        if let Some(off) = &self.time_off {
+            notes.push(format!("times: {off}"));
+        }
+        match (
+            &self.window_off,
+            self.time.as_ref().and_then(TimeSpec::describe),
+        ) {
+            (Some(off), _) => notes.push(format!("window off: {off}")),
+            (None, Some(window)) => notes.push(window),
+            (None, None) => {}
+        }
+        if !notes.is_empty() {
+            text.push_str(&format!(" ({})", notes.join("; ")));
         }
         if let Some(refused) = &self.refused {
             match self.skipped {

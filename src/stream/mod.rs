@@ -13,7 +13,7 @@ use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use densa_ws::{Stream, StreamEvent, StreamOptions};
 
-use crate::window::{TimeWindow, WindowOptions};
+use crate::time::{TimeOptions, TimeSpec};
 
 /// The column that numbers a stream's rows when it has no key (`row_`, `row__` and so on
 /// when its rows have a column of that name).
@@ -43,8 +43,8 @@ pub(crate) struct StreamSpec {
     /// Headers of the request that opens the connection, as given (`$NAME` values are read
     /// from the environment when it opens).
     pub(crate) headers: Vec<(String, String)>,
-    /// The rows kept by their time, if a window is given.
-    pub(crate) window: Option<TimeWindow>,
+    /// The column of the rows' times, and the window kept over it, if given.
+    pub(crate) time: Option<TimeSpec>,
     /// The table name asked for.
     pub(crate) name: Option<String>,
 }
@@ -58,7 +58,7 @@ impl std::fmt::Debug for StreamSpec {
             .field("arrow", &self.arrow)
             .field("subscribe", &self.subscribe.len())
             .field("headers", &headers)
-            .field("window", &self.window)
+            .field("time", &self.time)
             .field("name", &self.name)
             .finish()
     }
@@ -82,12 +82,12 @@ impl StreamSpec {
             arrow: false,
             subscribe: Vec::new(),
             headers: Vec::new(),
-            window: None,
+            time: None,
             name: None,
         };
-        let mut window = WindowOptions::default();
+        let mut time = TimeOptions::default();
         for (name, value) in options {
-            if window.take(&name, &value)? {
+            if time.take(&name, &value)? {
                 continue;
             }
             match (name.as_str(), value.is_empty()) {
@@ -106,12 +106,12 @@ impl StreamSpec {
                         "unknown stream option {}: Studio knows key=COLUMN, subscribe=TEXT \
                          (with & written %26), arrow, header=NAME:VALUE, name=TABLE and {}",
                         option_text(&name, &value),
-                        WindowOptions::KNOWN
+                        TimeOptions::KNOWN
                     ))
                 }
             }
         }
-        spec.window = window.finish()?;
+        spec.time = time.finish(spec.key.as_deref())?;
         Ok(spec)
     }
 
@@ -142,8 +142,8 @@ impl StreamSpec {
         if self.arrow {
             options.push("arrow".to_owned());
         }
-        if let Some(window) = &self.window {
-            options.extend(window.options());
+        if let Some(time) = &self.time {
+            options.extend(time.options());
         }
         if let Some(name) = &self.name {
             options.push(format!("name={}", encode(name)));

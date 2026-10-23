@@ -119,6 +119,34 @@ mod streams {
         assert!((1..=300).contains(&rows), "{rows} rows: {status}");
     }
 
+    #[test]
+    fn a_batch_whose_times_read_clears_what_the_last_one_said() {
+        let (_ui, mut source) = quiet("#time=at");
+        let at = |values: Vec<&str>| {
+            let rows = arrow_array::StringArray::from(values);
+            let batch = RecordBatch::try_from_iter([("at", Arc::new(rows) as _)]).unwrap();
+            Arrived::Rows {
+                batch,
+                deleted: None,
+            }
+        };
+        let _ = source.timed(at(vec!["soon"]));
+        let status = source.status(&_ui);
+        assert!(status.contains("(times: 1 times in at neither"), "{status}");
+        let Arrived::Rows { batch, .. } = source.timed(at(vec!["5"])) else {
+            panic!("rows stay rows");
+        };
+        assert!(matches!(
+            batch.schema().field(0).data_type(),
+            DataType::Timestamp(..)
+        ));
+        assert!(
+            !source.status(&_ui).contains("times:"),
+            "{}",
+            source.status(&_ui)
+        );
+    }
+
     /// A stream source on a port nothing answers on, fed by hand.
     fn quiet(key: &str) -> (Ui, Source) {
         opened(&format!("ws://127.0.0.1:9/quiet{key}"), 0)
@@ -281,7 +309,10 @@ mod flights {
         assert_eq!(source.rows(&ui), 10, "the rows come all the same");
         let status = source.status(&ui);
         assert!(
-            status.ends_with("10 rows (window off: the window's column when is not in the rows)"),
+            status.ends_with(
+                "10 rows (times: the time column when is not in the rows; \
+                 window off: the window's column when is not in the rows)"
+            ),
             "{status}"
         );
     }
@@ -294,11 +325,16 @@ mod flights {
         assert!(!source.blocks_query(), "done: nothing to wait for");
         source.skipped = 7;
         source.refused = Some("old".to_owned());
+        source.window_off = Some("old".to_owned());
         let (schema, rows) = source.snapshot(&ui).unwrap();
         let columns = RecordBatch::new_empty(schema);
         source.start_table(&mut ui, &columns);
         assert_eq!(source.rows(&ui), 0, "the last try's rows went");
         assert!(source.refused.is_none() && source.skipped == 0);
+        assert!(
+            source.window_off.is_none(),
+            "the new table has no window to be off"
+        );
         assert!(source.changed);
 
         let unkeyable = RecordBatch::try_from_iter([(

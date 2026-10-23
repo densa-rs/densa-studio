@@ -10,6 +10,7 @@
 mod args;
 mod chart;
 mod config;
+mod flight;
 mod query;
 mod sample;
 mod source;

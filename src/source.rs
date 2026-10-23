@@ -1,5 +1,6 @@
-//! A data source: a file read in the background, or a live stream, into a live table shown
-//! in a grid of its own and queryable with SQL by its table name.
+//! A data source: a file read in the background, a live stream, or an Arrow Flight service's
+//! data, into a live table shown in a grid of its own and queryable with SQL by its table
+//! name.
 
 use std::error::Error;
 use std::path::Path;
@@ -14,6 +15,7 @@ use densa_files::{Loader, OpenOptions};
 use densa_ui::{Ui, WidgetId};
 use densa_widgets::{DataGrid, DockArea, DockAt, DockPanel, Panel};
 
+use crate::flight::{Fetch, FlightSpec};
 use crate::stream::{Arrived, Live, StreamSpec};
 
 /// The key column every file gets, numbering its rows as they are read (`row_`, `row__`
@@ -119,6 +121,9 @@ enum Feed {
     },
     /// A stream that goes on; its table is made when its first rows show its columns.
     Stream { live: Live, started: bool },
+    /// A Flight service's data, read to its end; its table is made (anew) when its columns
+    /// come.
+    Flight { fetch: Fetch, started: bool },
 }
 
 /// A file loading (or loaded), or a stream, in a live table.
@@ -200,6 +205,31 @@ impl Source {
         Ok(source)
     }
 
+    /// Opens the Flight source `spec` in a new tab of `dock` placed `at`, named `name` for
+    /// SQL, and starts reading it, calling `wake` as rows arrive. Its tab is keyed by what
+    /// it asks for.
+    pub(crate) fn open_flight(
+        ui: &mut Ui,
+        dock: WidgetId,
+        spec: &FlightSpec,
+        name: String,
+        at: DockAt,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Self, Box<dyn Error>> {
+        let fetch = Fetch::connect(spec, wake)?;
+        let table = LiveTable::new(waiting(fetch.key()), fetch.key())?;
+        let origin = spec.origin();
+        let (panel, grid) = add_tab(ui, dock, table, spec.title(), &origin, at)?;
+        let feed = Feed::Flight {
+            fetch,
+            started: false,
+        };
+        let mut source = Self::new(name, origin, panel, grid, feed);
+        // Nothing for SQL until its columns come.
+        source.changed = false;
+        Ok(source)
+    }
+
     fn new(name: String, origin: String, panel: WidgetId, grid: WidgetId, feed: Feed) -> Self {
         Self {
             name,
@@ -213,9 +243,14 @@ impl Source {
         }
     }
 
-    /// Whether the source has all its rows: a file read to its end. A stream never is.
+    /// Whether the source has all its rows: a file or a Flight result read to its end (or
+    /// as far as it could be). A stream never is.
     pub(crate) fn is_done(&self) -> bool {
-        matches!(self.feed, Feed::File { done: true, .. })
+        match &self.feed {
+            Feed::File { done, .. } => *done,
+            Feed::Flight { fetch, .. } => fetch.is_done(),
+            Feed::Stream { .. } => false,
+        }
     }
 
     /// Whether rows keep coming: a stream.
@@ -251,8 +286,13 @@ impl Source {
                     None => return false,
                     Some(arrived) => arrived,
                 },
+                Feed::Flight { fetch, .. } => match fetch.next() {
+                    None => return false,
+                    Some(arrived) => arrived,
+                },
             };
             match next {
+                Arrived::Columns(columns) => self.start_table(ui, &columns),
                 Arrived::Rows { batch, deleted } => self.upsert(ui, batch, deleted),
                 Arrived::Refused { rows, reason } => {
                     self.skipped += rows as u64;
@@ -300,18 +340,31 @@ impl Source {
     /// Makes a stream's table from its first rows' columns (again with later rows while it
     /// cannot be made, the reason given each time).
     fn ready_table(&mut self, ui: &mut Ui, batch: &RecordBatch) -> Result<(), String> {
-        let Feed::Stream { live, started } = &mut self.feed else {
-            return Ok(());
+        let (key, started) = match &mut self.feed {
+            Feed::Stream { live, started } => (live.key(), started),
+            Feed::Flight { fetch, started } => (fetch.key(), started),
+            Feed::File { .. } => return Ok(()),
         };
         if *started {
             return Ok(());
         }
-        let table = LiveTable::new(batch.schema(), live.key()).map_err(|e| e.to_string())?;
+        let table = LiveTable::new(batch.schema(), key).map_err(|e| e.to_string())?;
         ui.update::<Grid, _>(self.grid, |grid, cx| {
             *grid.model_mut(cx).table_mut() = table
         });
         *started = true;
         Ok(())
+    }
+
+    /// A table of `columns`, made anew: a Flight result starts (over).
+    fn start_table(&mut self, ui: &mut Ui, columns: &RecordBatch) {
+        if let Feed::Flight { started, .. } = &mut self.feed {
+            *started = false;
+        }
+        match self.ready_table(ui, columns) {
+            Ok(()) => self.changed = true,
+            Err(error) => self.refused = Some(error),
+        }
     }
 
     /// The rows taken in so far.
@@ -330,6 +383,9 @@ impl Source {
             } => format!("{}: reading, {rows} of {}", self.name, grouped(*total)),
             Feed::File { .. } => format!("{}: reading, {rows} rows", self.name),
             Feed::Stream { live, .. } => format!("{}: {}, {rows} rows", self.name, live.status()),
+            Feed::Flight { fetch, .. } => {
+                format!("{}: {}, {rows} rows", self.name, fetch.status())
+            }
         };
         if let Some(refused) = &self.refused {
             text.push_str(&format!(", {} skipped ({refused})", grouped(self.skipped)));
@@ -346,7 +402,8 @@ impl Source {
 
     /// The live rows as they are now, for SQL.
     pub(crate) fn snapshot(&self, ui: &Ui) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
-        if let Feed::Stream { started: false, .. } = self.feed {
+        if let Feed::Stream { started: false, .. } | Feed::Flight { started: false, .. } = self.feed
+        {
             return Err("no rows yet".to_owned());
         }
         let grid = ui.widget::<Grid>(self.grid).ok_or("its tab is gone")?;
@@ -580,6 +637,104 @@ mod tests {
                 "{}",
                 source.status(ui)
             );
+        }
+    }
+
+    mod flights {
+        use std::time::Duration;
+
+        use densa_paragraph::TextSystem;
+
+        use super::*;
+
+        /// A dock with the Flight source `text` open in it, read to its end (or 20 s).
+        fn read(text: &str) -> (Ui, Source) {
+            let mut ui = Ui::new(TextSystem::bundled().unwrap());
+            let dock = ui
+                .add(ui.root(), DockArea::new(), DockArea::style())
+                .unwrap();
+            let spec = FlightSpec::parse(text).unwrap();
+            let name = spec.name_hint();
+            let mut source =
+                Source::open_flight(&mut ui, dock, &spec, name, DockAt::First, || {}).unwrap();
+            assert!(!source.is_live());
+            let until = Instant::now() + Duration::from_secs(20);
+            while !source.is_done() && Instant::now() < until {
+                source.take(&mut ui, Instant::now() + Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            (ui, source)
+        }
+
+        fn columns(ui: &Ui, source: &Source) -> Vec<String> {
+            let grid = ui.widget::<Grid>(source.grid).unwrap();
+            let schema = grid.model().table().schema().clone();
+            schema.fields().iter().map(|f| f.name().clone()).collect()
+        }
+
+        #[test]
+        fn a_flight_result_fills_its_table_numbered() {
+            let url = samples::flight_server_of(10_000).unwrap();
+            let (ui, source) = read(&format!("{url}#path=requests"));
+            assert!(source.is_done(), "{}", source.status(&ui));
+            assert_eq!(source.rows(&ui), 10_000);
+            assert_eq!(source.status(&ui), "requests: done, 10,000 rows");
+            let columns = columns(&ui, &source);
+            assert_eq!(columns.first().map(String::as_str), Some("request"));
+            assert_eq!(columns.last().map(String::as_str), Some("row"));
+            assert!(source.changed);
+            let (_, batches) = source.snapshot(&ui).unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                10_000
+            );
+        }
+
+        #[test]
+        fn a_keyed_flight_result_keeps_a_row_per_key() {
+            let url = samples::flight_server_of(2_000).unwrap();
+            let (ui, source) = read(&format!("{url}#sql=SELECT%201&key=service"));
+            assert!(source.is_done(), "{}", source.status(&ui));
+            assert!(
+                source.rows(&ui) <= 6,
+                "one row per service: {}",
+                source.rows(&ui)
+            );
+            assert!(!columns(&ui, &source).contains(&"row".to_owned()));
+        }
+
+        #[test]
+        fn a_refused_request_says_why() {
+            let url = samples::flight_server_of(10).unwrap();
+            let (ui, source) = read(&format!("{url}#ticket=9"));
+            assert!(source.is_done());
+            let status = source.status(&ui);
+            assert!(status.starts_with("flight: failed: "), "{status}");
+            assert!(source.snapshot(&ui).is_err(), "no columns came");
+        }
+
+        #[test]
+        fn a_service_that_is_not_there_is_asked_again() {
+            let mut ui = Ui::new(TextSystem::bundled().unwrap());
+            let dock = ui
+                .add(ui.root(), DockArea::new(), DockArea::style())
+                .unwrap();
+            let spec = FlightSpec::parse("grpc://127.0.0.1:9#path=x").unwrap();
+            let mut source =
+                Source::open_flight(&mut ui, dock, &spec, "x".to_owned(), DockAt::First, || {})
+                    .unwrap();
+            assert_eq!(source.status(&ui), "x: asking, 0 rows");
+            let until = Instant::now() + Duration::from_secs(15);
+            while !source.status(&ui).contains("asking again") && Instant::now() < until {
+                source.take(&mut ui, Instant::now() + Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                source.status(&ui).contains("asking again in"),
+                "{}",
+                source.status(&ui)
+            );
+            assert!(!source.is_done());
         }
     }
 

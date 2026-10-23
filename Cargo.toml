@@ -29,6 +29,7 @@ densa-widgets = { git = "https://github.com/densa-rs/densa" }
 densa-window = { git = "https://github.com/densa-rs/densa" }
 densa-datafusion = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-files = { git = "https://github.com/densa-rs/densa-connectors" }
+densa-flight = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-ws = { git = "https://github.com/densa-rs/densa-connectors" }
 # The connectors' sample web requests and sensor stream, for --sample.
 samples = { git = "https://github.com/densa-rs/densa-connectors" }
@@ -37,6 +38,8 @@ samples = { git = "https://github.com/densa-rs/densa-connectors" }
 # Text without the system's fonts, for tests of the panels.
 densa-paragraph = { git = "https://github.com/densa-rs/densa", default-features = false }
 densa-text = { git = "https://github.com/densa-rs/densa" }
+# A Flight service to read in tests.
+samples = { git = "https://github.com/densa-rs/densa-connectors", features = ["flight"] }
 
 [lints.rust]
 unsafe_code = "forbid"

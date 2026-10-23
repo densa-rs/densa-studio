@@ -11,9 +11,10 @@ use densa_widgets::{DockArea, DockAt, DockLayout, DockSide, Label, Panel, TextIn
 use densa_window::{App, Host, Waker};
 
 use crate::config;
+use crate::flight::FlightSpec;
 use crate::query::Query;
 use crate::source::{table_name, Source};
-use crate::stream::StreamSpec;
+use crate::stream::{parts, StreamSpec};
 
 /// How often the status bar is written again while something loads.
 const STATUS_EVERY: Duration = Duration::from_millis(200);
@@ -102,25 +103,18 @@ impl Studio {
         }
     }
 
-    /// Opens `text`, a file's path or a stream's URL, as a new source in a tab beside the
-    /// other sources; one already open has its tab shown instead.
+    /// Opens `text`, a file's path or a stream's or Flight service's URL, as a new source in
+    /// a tab beside the other sources; one already open has its tab shown instead.
     fn open(&mut self, ui: &mut Ui, text: &str) {
         let (Some(ids), Some(waker)) = (self.ids, self.waker.clone()) else {
             return;
         };
-        let stream = match StreamSpec::is_stream(text) {
-            true => match StreamSpec::parse(text) {
-                Ok(spec) => Some(spec),
-                Err(error) => return self.problem(format!("{text} not opened: {error}")),
-            },
-            false => None,
+        let what = Opening::read(text);
+        let what = match what {
+            Ok(what) => what,
+            Err(error) => return self.problem(format!("{} not opened: {error}", shown(text))),
         };
-        let origin = match &stream {
-            Some(spec) => Some(spec.origin()),
-            None => std::fs::canonicalize(text)
-                .ok()
-                .map(|p| p.display().to_string()),
-        };
+        let origin = what.origin();
         if let Some(open) = self
             .sources
             .iter()
@@ -140,32 +134,16 @@ impl Studio {
         let wake = move || {
             waker.wake();
         };
-        let (opened, what) = match &stream {
-            Some(spec) => {
-                let name = table_name(Path::new(&spec.name_hint()), &taken);
-                (
-                    Source::open_stream(ui, ids.dock, spec, name, at, wake),
-                    spec.title(),
-                )
-            }
-            None => {
-                let path = Path::new(text);
-                let name = table_name(path, &taken);
-                let file = path.file_name().unwrap_or(path.as_os_str());
-                let file = file.to_string_lossy().into_owned();
-                (Source::open_file(ui, ids.dock, path, name, at, wake), file)
-            }
-        };
-        match opened {
+        match what.open(ui, ids.dock, &taken, at, wake) {
             Ok(source) => {
-                self.note = format!("Opened {what} as {}", source.name);
+                self.note = format!("Opened {} as {}", what.title(), source.name);
                 let _ = DockArea::show_panel(ui, ids.dock, source.panel);
                 self.sources.push(source);
                 if let Some(welcome) = self.welcome.take() {
                     let _ = DockArea::remove_panel(ui, ids.dock, welcome);
                 }
             }
-            Err(error) => self.problem(format!("{text} not opened: {error}")),
+            Err(error) => self.problem(format!("{} not opened: {error}", shown(text))),
         }
     }
 
@@ -411,5 +389,119 @@ impl App for Studio {
         }
         // Loaders and queries wake the window as rows come; rows left over need another frame.
         more || self.start.close_at.is_some()
+    }
+}
+
+/// What a source is opened from.
+enum Opening {
+    File(PathBuf),
+    Stream(StreamSpec),
+    Flight(FlightSpec),
+}
+
+impl Opening {
+    /// What `text` names: a stream's or Flight service's URL, or else a file's path.
+    fn read(text: &str) -> Result<Self, String> {
+        if StreamSpec::is_stream(text) {
+            return StreamSpec::parse(text).map(Self::Stream);
+        }
+        if FlightSpec::is_flight(text) {
+            return FlightSpec::parse(text).map(Self::Flight);
+        }
+        Ok(Self::File(PathBuf::from(text)))
+    }
+
+    /// What it is known by when open; `None` for a file that is not there.
+    fn origin(&self) -> Option<String> {
+        match self {
+            Self::File(path) => std::fs::canonicalize(path)
+                .ok()
+                .map(|p| p.display().to_string()),
+            Self::Stream(spec) => Some(spec.origin()),
+            Self::Flight(spec) => Some(spec.origin()),
+        }
+    }
+
+    /// What it is called in a note.
+    fn title(&self) -> String {
+        match self {
+            Self::File(path) => path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            Self::Stream(spec) => spec.title(),
+            Self::Flight(spec) => spec.title(),
+        }
+    }
+
+    /// Opens it in a tab of `dock` placed `at`, named apart from `taken`.
+    fn open(
+        &self,
+        ui: &mut Ui,
+        dock: WidgetId,
+        taken: &[String],
+        at: DockAt,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Source, Box<dyn Error>> {
+        match self {
+            Self::File(path) => {
+                let name = table_name(path, taken);
+                Source::open_file(ui, dock, path, name, at, wake)
+            }
+            Self::Stream(spec) => {
+                let name = table_name(Path::new(&spec.name_hint()), taken);
+                Source::open_stream(ui, dock, spec, name, at, wake)
+            }
+            Self::Flight(spec) => {
+                let name = table_name(Path::new(&spec.name_hint()), taken);
+                Source::open_flight(ui, dock, spec, name, at, wake)
+            }
+        }
+    }
+}
+
+/// `text` as a message may show it: a URL by its scheme, host and path alone (what follows
+/// `#` or `?`, and a user and password, may hold secrets), a path as it is.
+fn shown(text: &str) -> String {
+    if !StreamSpec::is_stream(text) && !FlightSpec::is_flight(text) {
+        return text.to_owned();
+    }
+    let (scheme, host, path) = parts(text.trim());
+    match path.is_empty() {
+        true => format!("{scheme}://{host}"),
+        false => format!("{scheme}://{host}/{path}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_is_opened_is_told_by_its_scheme() {
+        assert!(matches!(Opening::read("data/a.csv"), Ok(Opening::File(_))));
+        assert!(matches!(Opening::read("ws://h/p"), Ok(Opening::Stream(_))));
+        assert!(matches!(
+            Opening::read("grpc://h#path=a"),
+            Ok(Opening::Flight(_))
+        ));
+        assert!(
+            Opening::read("grpc://h").is_err(),
+            "a Flight URL must ask for something"
+        );
+        let file = Opening::read("missing/nowhere.csv").unwrap();
+        assert_eq!(file.origin(), None, "a file that is not there");
+        assert_eq!(file.title(), "nowhere.csv");
+        let flight = Opening::read("grpc://h#path=a/b").unwrap();
+        assert_eq!(flight.title(), "h/a/b");
+    }
+
+    #[test]
+    fn messages_show_a_url_without_what_may_be_secret() {
+        let shown = shown("grpc+tls://me:pw@h:443/x?token=t#sql=a&header=authorization:secret");
+        assert_eq!(shown, "grpc+tls://h:443/x");
+        assert_eq!(super::shown(" ws://h#key=a"), "ws://h");
+        assert_eq!(super::shown("data/a b.csv"), "data/a b.csv");
     }
 }

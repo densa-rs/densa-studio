@@ -791,6 +791,26 @@ mod tests {
         }
 
         #[test]
+        fn a_result_asked_again_after_a_failure_starts_over_from_row_0() {
+            let url = samples::flight_server_failing_once(4_000).unwrap();
+            let (ui, source) = read(&format!("{url}#path=requests"));
+            assert!(source.is_done(), "{}", source.status(&ui));
+            assert_eq!(source.rows(&ui), 4_000, "the first quarter was read twice");
+            let (schema, batches) = source.snapshot(&ui).unwrap();
+            let row = schema.index_of("row").unwrap();
+            let numbers: Vec<u64> = batches
+                .iter()
+                .flat_map(|b| {
+                    let column = b.column(row);
+                    let column = column.as_any().downcast_ref::<arrow_array::UInt64Array>();
+                    column.unwrap().values().to_vec()
+                })
+                .collect();
+            assert_eq!(numbers.iter().min(), Some(&0), "numbered from 0 again");
+            assert_eq!(numbers.iter().max(), Some(&3_999));
+        }
+
+        #[test]
         fn a_service_that_is_not_there_is_asked_again() {
             let mut ui = Ui::new(TextSystem::bundled().unwrap());
             let dock = ui

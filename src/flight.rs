@@ -361,6 +361,18 @@ mod tests {
     }
 
     #[test]
+    fn a_query_as_long_as_a_tab_shows_is_not_cut() {
+        let spec = FlightSpec::parse(&format!("grpc://h#sql={}", "x".repeat(40))).unwrap();
+        assert_eq!(spec.title(), format!("h: {}", "x".repeat(40)));
+        let upper = FlightSpec::parse("GRPC://H:1#path=a").unwrap();
+        assert_eq!(
+            upper.origin(),
+            "grpc://h:1#path=a",
+            "scheme and host in lower case"
+        );
+    }
+
+    #[test]
     fn a_long_query_is_cut_short_in_its_tab() {
         let query = format!("sql={}", "x".repeat(50));
         let spec = FlightSpec::parse(&format!("grpc://h#{query}")).unwrap();

@@ -1,7 +1,7 @@
 # densa studio
 
-Open Parquet and CSV files and live WebSocket streams and explore them at once: each fills a
-grid of its own as rows come, SQL runs over all of them (again each second, if you like, as
+Open Parquet and CSV files, live WebSocket streams and Arrow Flight services and explore them
+at once: each fills a grid of its own as rows come, SQL runs over all of them (again each second, if you like, as
 they change), and the result is charted as it comes. An open-source application built on
 [densa](https://github.com/densa-rs/densa), the Rust toolkit for applications that show a lot
 of live data, and on its [connectors](https://github.com/densa-rs/densa-connectors).
@@ -24,6 +24,7 @@ densa-studio trips.parquet zones.csv
 densa-studio --sample        # a million sample web requests (written to your cache
                              # folder the first time) and a local stream of 500 sensors
 densa-studio "wss://example.com/trades#key=id"
+densa-studio "grpc+tls://flight.example.com:443#sql=SELECT * FROM trips&header=authorization:Bearer $TOKEN"
 ```
 
 Or from a clone: `cargo run --release -- trips.parquet`.
@@ -58,6 +59,18 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   connection opens (percent-encoded: `%7B` for `{`, `%23` for `#`), and `#arrow` reads Arrow
   IPC instead of JSON, joined with `&`. The status bar shows each stream's connection, rows
   per second and messages skipped; a lost connection is opened again.
+- **Arrow Flight.** A `grpc://` or `grpc+tls://` URL opens a Flight service's data in a tab
+  that fills as it arrives. After `#`, say what to ask for: `sql=QUERY` (a Flight SQL
+  server), `path=A/B` (a dataset by its path) or `ticket=T`; `key=COLUMN` keeps the latest
+  row of each key (without one, rows are numbered), and `name=TABLE` names its table for
+  SQL. A service that cannot be reached is asked again, with waits that grow; the status bar
+  says so, and the first query does not wait for it.
+- **Headers, without writing secrets down.** Streams and Flight sources take
+  `header=NAME:VALUE` after `#`, any number of times; `$NAME` (or `${NAME}`) in a value is
+  read from that environment variable when the source opens, so
+  `header=authorization:Bearer $TOKEN` sends a token that is never typed, shown, or kept in
+  the saved arrangement (`$$` is a `$`). A user and password in a URL are refused: they go
+  in a header. Write `&`, `#` and `%` in option values as `%26`, `%23` and `%25`.
 - **Live SQL.** The Live button beside the query (or `--live`) runs the last query again each
   second while its sources change: its result is updated in place (the selected row and the
   sort stay) and the chart moves with it.
@@ -72,8 +85,8 @@ sources change, `--light` for the light theme, `--seconds N` closes after N seco
 
 ## Next
 
-Arrow Flight sources; headers (tokens) for streams; keeping a stream's last minutes rather
-than its newest rows; saving query results; opening files by dropping them on the window; bar
+Browsing what a Flight SQL server has; keeping a stream's last minutes rather than its newest
+rows; saving query results; opening files by dropping them on the window; bar
 charts of text categories and picking the charted columns without SQL.
 
 ## License

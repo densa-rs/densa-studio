@@ -820,6 +820,37 @@ mod tests {
     }
 
     #[test]
+    fn only_rows_kept_for_a_while_are_let_go() {
+        let many: ArrayRef = Arc::new(arrow_array::Int8Array::from(vec![
+            0;
+            KEPT_ROWS as usize + 1
+        ]));
+        let batch = rows(vec![("x", many)]);
+        let (_, deleted) = Keying::new(None, None).ready(&batch).unwrap();
+        assert!(deleted.is_none(), "every row kept");
+        let (_, deleted) = Keying::new(None, Some(KEPT_ROWS)).ready(&batch).unwrap();
+        assert_eq!(deleted.unwrap().values(), &[0], "the oldest let go");
+        let mut keying = Keying::new(None, None);
+        keying
+            .ready(&rows(vec![(
+                "x",
+                Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+            )]))
+            .unwrap();
+        keying.restart();
+        let (numbered, _) = keying
+            .ready(&rows(vec![(
+                "x",
+                Arc::new(StringArray::from(vec!["b"])) as ArrayRef,
+            )]))
+            .unwrap();
+        assert_eq!(
+            numbered.column(1).as_primitive::<UInt64Type>().values(),
+            &[0]
+        );
+    }
+
+    #[test]
     fn a_key_of_floats_becomes_whole_numbers() {
         let ids: ArrayRef = Arc::new(Float64Array::from(vec![Some(3.0), None, Some(-7.0)]));
         let batch = rows(vec![

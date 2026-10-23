@@ -2,12 +2,14 @@
 //! URL whose part after `#` says what to ask for and how to keep it:
 //! `grpc://host:port#sql=SELECT ...&key=id&header=authorization:$TOKEN&name=trips`.
 
-use arrow_array::RecordBatch;
-use densa_flight::{FlightEvent, FlightOptions, FlightStream};
+use std::fmt;
 use std::time::Duration;
 
+use arrow_array::RecordBatch;
+use densa_flight::{FlightEvent, FlightOptions, FlightStream};
+
 use crate::stream::{
-    header, header_value, option_text, options, parts, shortened, Arrived, Keying,
+    encode, header, header_value, option_text, options, parts, shortened, Arrived, Keying,
 };
 
 /// A failed read that may pass is tried again after this, then twice as long, up to
@@ -28,8 +30,9 @@ pub(crate) enum Request {
     Ticket(String),
 }
 
-/// How to read a Flight source: what its URL says.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How to read a Flight source: what its URL says. Its `Debug` output leaves header values
+/// out.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct FlightSpec {
     /// The URL without the part after `#`.
     pub(crate) url: String,
@@ -41,6 +44,27 @@ pub(crate) struct FlightSpec {
     pub(crate) headers: Vec<(String, String)>,
     /// The table name asked for.
     pub(crate) name: Option<String>,
+}
+
+impl fmt::Debug for FlightSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("FlightSpec")
+            .field("url", &self.url)
+            .field("request", &self.request)
+            .field("key", &self.key)
+            .field("headers", &headers)
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+/// Sets `slot` to `value` once: an option given twice is a mistake.
+fn once(slot: &mut Option<String>, option: &str, value: String) -> Result<(), String> {
+    match slot.replace(value) {
+        None => Ok(()),
+        Some(_) => Err(format!("{option}= is given twice")),
+    }
 }
 
 impl FlightSpec {
@@ -57,59 +81,60 @@ impl FlightSpec {
     /// separated by `&` after `#`.
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let (url, options) = options(text)?;
-        let (mut request, mut key, mut headers, mut name) = (None, None, Vec::new(), None);
+        let mut spec = Self {
+            url,
+            // Until an option says what to ask for.
+            request: Request::Ticket(String::new()),
+            key: None,
+            headers: Vec::new(),
+            name: None,
+        };
+        let mut asked = None;
         for (option, value) in options {
             if value.is_empty() {
                 return Err(format!("{option} needs a value"));
             }
-            let asked = match option.as_str() {
-                "sql" => Some(Request::Sql(value)),
-                "path" => Some(Request::Path(
-                    value
-                        .split('/')
-                        .filter(|p| !p.is_empty())
-                        .map(str::to_owned)
-                        .collect(),
-                )),
-                "ticket" => Some(Request::Ticket(value)),
-                "key" => {
-                    key = Some(value);
-                    None
-                }
-                "header" => {
-                    headers.push(header(&value)?);
-                    None
-                }
-                "name" => {
-                    name = Some(value);
-                    None
-                }
-                _ => {
-                    return Err(format!(
-                        "unknown Flight option {}: Studio knows sql=QUERY, path=A/B, \
-                         ticket=T, key=COLUMN, header=NAME:VALUE and name=TABLE",
-                        option_text(&option, &value)
-                    ))
-                }
-            };
-            if let Some(asked) = asked {
-                if request.replace(asked).is_some() {
+            if let Some(request) = spec.apply(&option, value)? {
+                if asked.replace(request).is_some() {
                     return Err("ask for one of sql=, path= or ticket=, not more".to_owned());
                 }
             }
         }
-        let request = request
+        spec.request = asked
             .ok_or("a Flight URL asks for something after #: sql=QUERY, path=A/B or ticket=T")?;
-        if matches!(&request, Request::Path(parts) if parts.is_empty()) {
+        if matches!(&spec.request, Request::Path(parts) if parts.is_empty()) {
             return Err("path= names a dataset: path=A/B".to_owned());
         }
-        Ok(Self {
-            url,
-            request,
-            key,
-            headers,
-            name,
-        })
+        Ok(spec)
+    }
+
+    /// Takes in the option `option=value`; what to ask for, if it says.
+    fn apply(&mut self, option: &str, value: String) -> Result<Option<Request>, String> {
+        let request = match option {
+            "sql" => Request::Sql(value),
+            "path" => Request::Path(
+                value
+                    .split('/')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            "ticket" => Request::Ticket(value),
+            "key" => return once(&mut self.key, option, value).map(|()| None),
+            "name" => return once(&mut self.name, option, value).map(|()| None),
+            "header" => {
+                self.headers.push(header(&value)?);
+                return Ok(None);
+            }
+            _ => {
+                return Err(format!(
+                    "unknown Flight option {}: Studio knows sql=QUERY, path=A/B, ticket=T, \
+                     key=COLUMN, header=NAME:VALUE and name=TABLE",
+                    option_text(option, &value)
+                ))
+            }
+        };
+        Ok(Some(request))
     }
 
     /// The host and what is asked: what the tab says.
@@ -140,13 +165,13 @@ impl FlightSpec {
     }
 
     /// What the source is known by, to find it open again and in a saved arrangement: its
-    /// scheme and host in lower case, what is asked (a ticket only by a hash of it), and its
-    /// key; not a user and password or headers, which may hold secrets.
+    /// scheme and host in lower case, what is asked (a ticket only by a hash of it), its key
+    /// and its name, written as options are; not headers, which may hold secrets.
     pub(crate) fn origin(&self) -> String {
         let (scheme, host, _) = parts(&self.url);
         let asked = match &self.request {
-            Request::Sql(query) => format!("sql={query}"),
-            Request::Path(path) => format!("path={}", path.join("/")),
+            Request::Sql(query) => format!("sql={}", encode(query)),
+            Request::Path(path) => format!("path={}", encode(&path.join("/"))),
             Request::Ticket(ticket) => format!("ticket#{:016x}", fnv(ticket.as_bytes())),
         };
         let mut origin = format!(
@@ -155,7 +180,10 @@ impl FlightSpec {
             host.to_ascii_lowercase()
         );
         if let Some(key) = &self.key {
-            origin.push_str(&format!("&key={key}"));
+            origin.push_str(&format!("&key={}", encode(key)));
+        }
+        if let Some(name) = &self.name {
+            origin.push_str(&format!("&name={}", encode(name)));
         }
         origin
     }
@@ -193,6 +221,8 @@ pub(crate) struct Fetch {
     state: String,
     /// Whether nothing more will come: the result ended, or reading it failed for good.
     done: bool,
+    /// Whether a read failed and is being tried again.
+    retried: bool,
 }
 
 impl Fetch {
@@ -203,9 +233,11 @@ impl Fetch {
     ) -> Result<Self, String> {
         Ok(Self {
             stream: spec.connect(wake)?,
-            keying: Keying::new(spec.key.clone()),
+            // A Flight result is finite: every row of it is kept.
+            keying: Keying::new(spec.key.clone(), None),
             state: "asking".to_owned(),
             done: false,
+            retried: false,
         })
     }
 
@@ -217,6 +249,12 @@ impl Fetch {
     /// Whether nothing more will come.
     pub(crate) fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Whether a read failed and is being tried again (a service not there, say): its rows
+    /// are not worth waiting for.
+    pub(crate) fn has_retried(&self) -> bool {
+        self.retried
     }
 
     /// How it stands, for the status bar.
@@ -251,6 +289,7 @@ impl Fetch {
                     "done".clone_into(&mut self.state);
                 }
                 FlightEvent::Retrying { reason, retry_in } => {
+                    self.retried = true;
                     let seconds = retry_in.as_secs_f64();
                     let reason = shortened(&reason);
                     self.state = format!("asking again in {seconds:.1} s ({reason})");
@@ -272,10 +311,10 @@ mod tests {
     #[test]
     fn a_flight_url_says_what_to_ask_for_after_the_hash() {
         let spec = FlightSpec::parse(
-            " grpc+tls://me:pw@Data.Example.com:443#sql=SELECT%20*%20FROM%20trips&key=id&header=authorization:%24TOKEN&name=trips ",
+            " grpc+tls://Data.Example.com:443#sql=SELECT%20*%20FROM%20trips&key=id&header=authorization:%24TOKEN&name=trips ",
         )
         .unwrap();
-        assert_eq!(spec.url, "grpc+tls://me:pw@Data.Example.com:443");
+        assert_eq!(spec.url, "grpc+tls://Data.Example.com:443");
         assert_eq!(spec.request, Request::Sql("SELECT * FROM trips".to_owned()));
         assert_eq!(spec.key.as_deref(), Some("id"));
         assert_eq!(
@@ -286,7 +325,18 @@ mod tests {
         assert_eq!(spec.title(), "Data.Example.com:443: SELECT * FROM trips");
         assert_eq!(
             spec.origin(),
-            "grpc+tls://data.example.com:443#sql=SELECT * FROM trips&key=id"
+            "grpc+tls://data.example.com:443#sql=SELECT%20*%20FROM%20trips&key=id&name=trips"
+        );
+        let printed = format!("{spec:?}");
+        assert!(!printed.contains("TOKEN"), "{printed}");
+        let refused = FlightSpec::parse("grpc://me:pw@h#path=a").unwrap_err();
+        assert!(refused.contains("no user and password"), "{refused}");
+        let twice = FlightSpec::parse("grpc://h#path=a&name=x&name=y").unwrap_err();
+        assert_eq!(twice, "name= is given twice");
+        let ambiguous = FlightSpec::parse("grpc://h#sql=a%26key=b").unwrap();
+        assert_ne!(
+            ambiguous.origin(),
+            FlightSpec::parse("grpc://h#sql=a&key=b").unwrap().origin()
         );
 
         let path = FlightSpec::parse("grpc://h:1#path=/sales//2026/").unwrap();

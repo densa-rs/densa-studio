@@ -25,8 +25,8 @@ const REASON_CHARS: usize = 120;
 /// two keys could be one.
 const MAX_WHOLE_FLOAT: f64 = 9_007_199_254_740_992.0;
 
-/// How to read a stream: what its URL says.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How to read a stream: what its URL says. Its `Debug` output leaves header values out.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct StreamSpec {
     /// The URL without the part after `#`.
     pub(crate) url: String,
@@ -40,6 +40,19 @@ pub(crate) struct StreamSpec {
     /// Headers of the request that opens the connection, as given (`$NAME` values are read
     /// from the environment when it opens).
     pub(crate) headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for StreamSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("StreamSpec")
+            .field("url", &self.url)
+            .field("key", &self.key)
+            .field("arrow", &self.arrow)
+            .field("subscribe", &self.subscribe.len())
+            .field("headers", &headers)
+            .finish()
+    }
 }
 
 impl StreamSpec {
@@ -63,6 +76,7 @@ impl StreamSpec {
         };
         for (name, value) in options {
             match (name.as_str(), value.is_empty()) {
+                ("key", false) if spec.key.is_some() => return Err("key= is given twice".into()),
                 ("key", false) => spec.key = Some(value),
                 ("subscribe", false) => spec.subscribe.push(value),
                 ("header", false) => spec.headers.push(header(&value)?),
@@ -104,7 +118,7 @@ impl StreamSpec {
         );
         let mut options = Vec::new();
         if let Some(key) = &self.key {
-            options.push(format!("key={key}"));
+            options.push(format!("key={}", encode(key)));
         }
         if self.arrow {
             options.push("arrow".to_owned());
@@ -147,13 +161,37 @@ impl StreamSpec {
 pub(crate) fn options(text: &str) -> Result<(String, Vec<(String, String)>), String> {
     let text = text.trim();
     let (url, options) = text.split_once('#').unwrap_or((text, ""));
+    if url.contains('@') {
+        return Err(
+            "Studio takes no user and password in a URL: give them as a header, \
+             header=authorization:$NAME"
+                .to_owned(),
+        );
+    }
     let mut decoded = Vec::new();
     for option in options.split('&').filter(|o| !o.is_empty()) {
         let (name, value) = option.split_once('=').unwrap_or((option, ""));
-        let value = decode(value).ok_or_else(|| format!("{option} is not percent-encoded"))?;
+        // The value may be a secret: the message names the option alone.
+        let value = decode(value).ok_or_else(|| format!("{name}= is not percent-encoded"))?;
         decoded.push((name.to_owned(), value));
     }
     Ok((url.to_owned(), decoded))
+}
+
+/// `value` written as an option's value: `%`, `&` and `#` (and spaces) escaped, so it reads
+/// back as it is.
+pub(crate) fn encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '&' => out.push_str("%26"),
+            '#' => out.push_str("%23"),
+            ' ' => out.push_str("%20"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// How an option was written, for a message about it (a header's value left out).
@@ -186,13 +224,39 @@ pub(crate) fn header(option: &str) -> Result<(String, String), String> {
     }
 }
 
-/// A header's value: `$NAME` is read from the environment variable `NAME` (so a token need
-/// not be typed, shown or kept), anything else is the value itself.
+/// A header's value with each `$NAME` or `${NAME}` in it read from that environment variable
+/// (so a token need not be typed, shown or kept: `Bearer $TOKEN`); `$$` is a `$`.
 pub(crate) fn header_value(given: &str) -> Result<String, String> {
-    match given.strip_prefix('$') {
-        Some(name) => std::env::var(name).map_err(|_| format!("${name} is not set")),
-        None => Ok(given.to_owned()),
+    let mut out = String::new();
+    let mut rest = given;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        if let Some(after) = rest.strip_prefix('$') {
+            out.push('$');
+            rest = after;
+            continue;
+        }
+        let (name, after) = match rest.strip_prefix('{') {
+            Some(braced) => {
+                let end = braced.find('}').ok_or("a ${NAME} without its }")?;
+                (&braced[..end], &braced[end + 1..])
+            }
+            None => {
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                rest.split_at(end)
+            }
+        };
+        if name.is_empty() {
+            return Err("a $ with no name after it (write $$ for a $)".to_owned());
+        }
+        out.push_str(&std::env::var(name).map_err(|_| format!("${name} is not set"))?);
+        rest = after;
     }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// `%XX` escapes in `text` decoded; `None` for a broken escape or bytes that are not UTF-8.
@@ -222,23 +286,26 @@ pub(crate) enum Keying {
     /// By a column of the rows.
     Column(String),
     /// By a number added to each row, counting from 0; its name is settled by the first
-    /// rows' columns (`row`, or `row_` and so on if they have one).
+    /// rows' columns (`row`, or `row_` and so on if they have one). With `kept`, only the
+    /// newest rows that many are kept.
     Numbered {
         name: String,
         next: u64,
         settled: bool,
+        kept: Option<u64>,
     },
 }
 
 impl Keying {
-    /// By `key`, or numbered without one.
-    pub(crate) fn new(key: Option<String>) -> Self {
+    /// By `key`, or numbered without one, keeping the newest `kept` rows if given.
+    pub(crate) fn new(key: Option<String>, kept: Option<u64>) -> Self {
         match key {
             Some(key) => Self::Column(key),
             None => Self::Numbered {
                 name: ROW.to_owned(),
                 next: 0,
                 settled: false,
+                kept,
             },
         }
     }
@@ -257,6 +324,7 @@ impl Keying {
             name,
             next,
             settled,
+            ..
         } = self
         {
             ROW.clone_into(name);
@@ -276,6 +344,7 @@ impl Keying {
                 name,
                 next,
                 settled,
+                kept,
             } => {
                 if !*settled {
                     *settled = true;
@@ -286,7 +355,7 @@ impl Keying {
                 let numbered = numbered(batch, name, *next)?;
                 let first = *next;
                 *next += batch.num_rows() as u64;
-                Ok((numbered, too_old(first, *next)))
+                Ok((numbered, kept.and_then(|kept| too_old(first, *next, kept))))
             }
         }
     }
@@ -328,7 +397,7 @@ impl Live {
     ) -> Result<Self, String> {
         Ok(Self {
             stream: spec.connect(wake)?,
-            keying: Keying::new(spec.key.clone()),
+            keying: Keying::new(spec.key.clone(), Some(KEPT_ROWS)),
             state: "connecting".to_owned(),
             skipped: (0, String::new()),
             rows: 0,
@@ -423,10 +492,10 @@ pub(crate) fn shortened(reason: &str) -> String {
 }
 
 /// The numbered rows to delete once `next` rows have come, `first` of them before this
-/// batch: those that fell out of the newest [`KEPT_ROWS`].
-fn too_old(first: u64, next: u64) -> Option<UInt64Array> {
-    let from = first.saturating_sub(KEPT_ROWS);
-    let to = next.saturating_sub(KEPT_ROWS);
+/// batch: those that fell out of the newest `kept`.
+fn too_old(first: u64, next: u64, kept: u64) -> Option<UInt64Array> {
+    let from = first.saturating_sub(kept);
+    let to = next.saturating_sub(kept);
     (from < to).then(|| UInt64Array::from_iter_values(from..to))
 }
 
@@ -514,8 +583,14 @@ mod tests {
 
     #[test]
     fn a_user_and_password_or_a_query_are_neither_shown_nor_kept() {
+        let refused = StreamSpec::parse("wss://me:secret@feed.example.com/v1#key=id");
+        assert!(refused
+            .unwrap_err()
+            .contains("no user and password in a URL"));
+        let slashed = StreamSpec::parse("wss://me:p/w@feed.example.com/v1").unwrap_err();
+        assert!(slashed.contains("no user and password"), "{slashed}");
         let spec = StreamSpec::parse(
-            "WSS://me:secret@Feed.Example.com:9443/v1/trades?token=t#key=id&arrow&subscribe=s",
+            "WSS://Feed.Example.com:9443/v1/trades?token=t#key=id&arrow&subscribe=s",
         )
         .unwrap();
         assert_eq!(spec.title(), "Feed.Example.com:9443/v1/trades");
@@ -524,7 +599,7 @@ mod tests {
             spec.origin(),
             "wss://feed.example.com:9443/v1/trades#key=id&arrow"
         );
-        let bare = StreamSpec::parse("ws://me@host").unwrap();
+        let bare = StreamSpec::parse("ws://host").unwrap();
         assert_eq!(
             (bare.title().as_str(), bare.name_hint().as_str()),
             ("host", "host")
@@ -558,6 +633,7 @@ mod tests {
             "ws://h/p#header=authorization:%20Bearer%20$X&header=sec-websocket-protocol:json",
         )
         .unwrap();
+        assert!(spec.headers.iter().all(|(name, _)| !name.is_empty()));
         assert_eq!(
             spec.headers,
             [
@@ -582,6 +658,56 @@ mod tests {
         assert!(error.contains("header=NAME:VALUE"), "{error}");
         let error = StreamSpec::parse("ws://h/p#header").unwrap_err();
         assert_eq!(error, "header needs a value");
+    }
+
+    #[test]
+    fn header_values_read_the_environment_wherever_named() {
+        let path = std::env::var("PATH").unwrap();
+        assert_eq!(
+            header_value("Bearer $PATH").unwrap(),
+            format!("Bearer {path}")
+        );
+        assert_eq!(header_value("a${PATH}b").unwrap(), format!("a{path}b"));
+        assert_eq!(header_value("$PATH-x").unwrap(), format!("{path}-x"));
+        assert_eq!(header_value("cost: $$5").unwrap(), "cost: $5");
+        assert_eq!(header_value("plain").unwrap(), "plain");
+        assert_eq!(
+            header_value("$DENSA_STUDIO_TEST_UNSET").unwrap_err(),
+            "$DENSA_STUDIO_TEST_UNSET is not set"
+        );
+        assert!(header_value("${PATH")
+            .unwrap_err()
+            .contains("without its }"));
+        assert!(header_value("a $ b").unwrap_err().contains("write $$"));
+        assert!(header_value("${}").unwrap_err().contains("no name"));
+    }
+
+    #[test]
+    fn a_value_that_is_not_percent_encoded_is_not_repeated() {
+        let error = StreamSpec::parse("ws://h/p#header=authorization:secret%ZZ").unwrap_err();
+        assert_eq!(error, "header= is not percent-encoded");
+        let twice = StreamSpec::parse("ws://h/p#key=a&key=b").unwrap_err();
+        assert_eq!(twice, "key= is given twice");
+    }
+
+    #[test]
+    fn option_values_are_written_back_as_they_read() {
+        let value = "a&b#c%d e";
+        assert_eq!(encode(value), "a%26b%23c%25d%20e");
+        let (_, options) = options(&format!("ws://h#key={}", encode(value))).unwrap();
+        assert_eq!(options, [("key".to_owned(), value.to_owned())]);
+        let spec = StreamSpec::parse("ws://h/p#key=a%26b").unwrap();
+        assert_eq!(spec.origin(), "ws://h/p#key=a%26b");
+    }
+
+    #[test]
+    fn a_debug_print_leaves_header_values_out() {
+        let spec = StreamSpec::parse("ws://h/p#header=authorization:secret&subscribe=s").unwrap();
+        let printed = format!("{spec:?}");
+        assert!(
+            printed.contains("authorization") && !printed.contains("secret"),
+            "{printed}"
+        );
     }
 
     #[test]
@@ -616,10 +742,13 @@ mod tests {
         assert_eq!(numbers.values(), &[7, 8]);
         assert_eq!(numbered.schema().field(1).name(), "row_");
 
-        assert!(too_old(0, KEPT_ROWS).is_none(), "as many as are kept");
-        let gone = too_old(KEPT_ROWS - 1, KEPT_ROWS + 2).unwrap();
+        assert!(
+            too_old(0, KEPT_ROWS, KEPT_ROWS).is_none(),
+            "as many as are kept"
+        );
+        let gone = too_old(KEPT_ROWS - 1, KEPT_ROWS + 2, KEPT_ROWS).unwrap();
         assert_eq!(gone.values(), &[0, 1]);
-        let gone = too_old(KEPT_ROWS + 2, KEPT_ROWS + 5).unwrap();
+        let gone = too_old(KEPT_ROWS + 2, KEPT_ROWS + 5, KEPT_ROWS).unwrap();
         assert_eq!(gone.values(), &[2, 3, 4]);
     }
 

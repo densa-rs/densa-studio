@@ -2,7 +2,7 @@
 //! status bar.
 
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use densa_datafusion::Engine;
@@ -13,7 +13,7 @@ use densa_window::{App, Host, Waker};
 use crate::config;
 use crate::flight::FlightSpec;
 use crate::query::Query;
-use crate::source::{table_name, Source};
+use crate::source::{sql_name, table_name, Source};
 use crate::stream::{parts, StreamSpec};
 
 /// How often the status bar is written again while something loads.
@@ -267,7 +267,7 @@ impl App for Studio {
             Style::row(),
         )?;
         let open = TextInput::new("").with_placeholder(
-            "Open a CSV or Parquet file or a ws:// stream: its path or URL, then Enter",
+            "Open a CSV or Parquet file, a ws:// stream or a grpc:// Flight service, then Enter",
         );
         let open = ui.add(toolbar, open, Style::row().grow(1.0))?;
         let dock = ui.add(root, DockArea::new(), DockArea::style())?;
@@ -366,8 +366,9 @@ impl App for Studio {
         if count > 0 {
             self.first_source = (self.first_source + 1) % count;
         }
-        // Streams never finish: the first query waits for the files alone.
-        let loading = self.sources.iter().any(|s| !s.is_done() && !s.is_live());
+        // Streams never finish, and a service not there may never answer: the first query
+        // waits for files and Flight results being read.
+        let loading = self.sources.iter().any(Source::blocks_query);
         if self.query_pending && !loading {
             self.query_pending = false;
             self.run_query(ui, false);
@@ -450,11 +451,11 @@ impl Opening {
                 Source::open_file(ui, dock, path, name, at, wake)
             }
             Self::Stream(spec) => {
-                let name = table_name(Path::new(&spec.name_hint()), taken);
+                let name = sql_name(&spec.name_hint(), taken);
                 Source::open_stream(ui, dock, spec, name, at, wake)
             }
             Self::Flight(spec) => {
-                let name = table_name(Path::new(&spec.name_hint()), taken);
+                let name = sql_name(&spec.name_hint(), taken);
                 Source::open_flight(ui, dock, spec, name, at, wake)
             }
         }

@@ -358,12 +358,36 @@ impl Source {
 
     /// A table of `columns`, made anew: a Flight result starts (over).
     fn start_table(&mut self, ui: &mut Ui, columns: &RecordBatch) {
-        if let Feed::Flight { started, .. } = &mut self.feed {
-            *started = false;
+        let key = match &mut self.feed {
+            Feed::Flight { fetch, started } => {
+                *started = false;
+                fetch.key().to_owned()
+            }
+            _ => return,
+        };
+        // What was said of the last try is old news.
+        self.skipped = 0;
+        self.refused = None;
+        if let Err(error) = self.ready_table(ui, columns) {
+            // The last try's rows go all the same: a table of the key alone, until columns
+            // that can make one come.
+            if let Ok(table) = LiveTable::new(waiting(&key), &key) {
+                ui.update::<Grid, _>(self.grid, |grid, cx| {
+                    *grid.model_mut(cx).table_mut() = table
+                });
+            }
+            self.refused = Some(error);
         }
-        match self.ready_table(ui, columns) {
-            Ok(()) => self.changed = true,
-            Err(error) => self.refused = Some(error),
+        self.changed = true;
+    }
+
+    /// Whether the first query should wait for this source: a file or a Flight result being
+    /// read, unless a read failed and is being tried again (a service not there).
+    pub(crate) fn blocks_query(&self) -> bool {
+        match &self.feed {
+            Feed::File { done, .. } => !done,
+            Feed::Flight { fetch, .. } => !fetch.is_done() && !fetch.has_retried(),
+            Feed::Stream { .. } => false,
         }
     }
 
@@ -388,7 +412,10 @@ impl Source {
             }
         };
         if let Some(refused) = &self.refused {
-            text.push_str(&format!(", {} skipped ({refused})", grouped(self.skipped)));
+            match self.skipped {
+                0 => text.push_str(&format!(", refused: {refused}")),
+                rows => text.push_str(&format!(", {} skipped ({refused})", grouped(rows))),
+            }
         }
         if let Feed::File {
             failed: Some(failed),
@@ -444,9 +471,16 @@ fn waiting(key: &str) -> SchemaRef {
 pub(crate) fn table_name(path: &Path, taken: &[String]) -> String {
     let stem = path
         .file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase())
+        .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut base: String = stem
+    sql_name(&stem, taken)
+}
+
+/// A SQL table name from `text`: lower case, with anything but letters, digits and `_` made
+/// `_`, a `_` after a word SQL reserves, and a number added if `taken` has it.
+pub(crate) fn sql_name(text: &str, taken: &[String]) -> String {
+    let mut base: String = text
+        .to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
@@ -492,6 +526,18 @@ mod tests {
         assert_eq!(name(""), "data");
         assert_eq!(name("Select.csv"), "select_");
         assert_eq!(name("orders.csv"), "orders", "only whole words");
+    }
+
+    #[test]
+    fn a_remote_source_is_named_as_written() {
+        assert_eq!(
+            sql_name("trips.v2", &[]),
+            "trips_v2",
+            "a dot is not an extension"
+        );
+        assert_eq!(sql_name("a\\b", &[]), "a_b");
+        assert_eq!(sql_name("Order", &[]), "order_");
+        assert_eq!(sql_name("x", &["x".to_owned()]), "x_2");
     }
 
     #[test]
@@ -714,6 +760,37 @@ mod tests {
         }
 
         #[test]
+        fn a_flight_result_read_again_starts_its_table_over() {
+            let url = samples::flight_server_of(3).unwrap();
+            let (mut ui, mut source) = read(&format!("{url}#path=requests"));
+            assert_eq!(source.rows(&ui), 3);
+            assert!(!source.blocks_query(), "done: nothing to wait for");
+            source.skipped = 7;
+            source.refused = Some("old".to_owned());
+            let columns = RecordBatch::new_empty(source.snapshot(&ui).unwrap().0);
+            source.start_table(&mut ui, &columns);
+            assert_eq!(source.rows(&ui), 0, "the last try's rows went");
+            assert!(source.refused.is_none() && source.skipped == 0);
+            assert!(source.changed);
+
+            let unkeyable = RecordBatch::try_from_iter([(
+                "row",
+                Arc::new(arrow_array::BooleanArray::from(vec![true])) as _,
+            )])
+            .unwrap();
+            let empty = RecordBatch::new_empty(unkeyable.schema());
+            source.upsert(&mut ui, columns.clone(), None);
+            source.start_table(&mut ui, &empty);
+            assert_eq!(source.rows(&ui), 0);
+            assert!(source.snapshot(&ui).is_err(), "no table for SQL");
+            assert!(
+                source.status(&ui).contains(", refused: "),
+                "{}",
+                source.status(&ui)
+            );
+        }
+
+        #[test]
         fn a_service_that_is_not_there_is_asked_again() {
             let mut ui = Ui::new(TextSystem::bundled().unwrap());
             let dock = ui
@@ -735,6 +812,10 @@ mod tests {
                 source.status(&ui)
             );
             assert!(!source.is_done());
+            assert!(
+                !source.blocks_query(),
+                "the first query need not wait for it"
+            );
         }
     }
 

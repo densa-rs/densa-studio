@@ -30,6 +30,8 @@ pub(crate) enum Request {
     Path(Vec<String>),
     /// The data behind a ticket.
     Ticket(String),
+    /// The tables a Flight SQL service has.
+    Tables,
 }
 
 /// How to read a Flight source: what its URL says. Its `Debug` output leaves header values
@@ -81,7 +83,8 @@ impl FlightSpec {
             .any(|scheme| lower.starts_with(scheme))
     }
 
-    /// Reads a Flight URL: one of `sql=QUERY`, `path=a/b` or `ticket=T`, then `key=COLUMN`,
+    /// Reads a Flight URL: one of `sql=QUERY`, `path=a/b`, `ticket=T` or `tables`, then
+    /// `key=COLUMN`,
     /// `header=NAME:VALUE` (any number of times), `name=TABLE` and a window
     /// (`time=COLUMN&window=10m`, `unit=s`), percent-encoded and separated by `&` after `#`.
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
@@ -101,17 +104,22 @@ impl FlightSpec {
             if time.take(&option, &value)? {
                 continue;
             }
-            if value.is_empty() {
-                return Err(format!("{option} needs a value"));
-            }
-            if let Some(request) = spec.apply(&option, value)? {
+            let request = match (option.as_str(), value.is_empty()) {
+                ("tables", true) => Some(Request::Tables),
+                (_, true) => return Err(format!("{option} needs a value")),
+                _ => spec.apply(&option, value)?,
+            };
+            if let Some(request) = request {
                 if asked.replace(request).is_some() {
-                    return Err("ask for one of sql=, path= or ticket=, not more".to_owned());
+                    return Err(
+                        "ask for one of sql=, path=, ticket= or tables, not more".to_owned()
+                    );
                 }
             }
         }
-        spec.request = asked
-            .ok_or("a Flight URL asks for something after #: sql=QUERY, path=A/B or ticket=T")?;
+        spec.request = asked.ok_or(
+            "a Flight URL asks for something after #: sql=QUERY, path=A/B, ticket=T or tables",
+        )?;
         if matches!(&spec.request, Request::Path(parts) if parts.is_empty()) {
             return Err("path= names a dataset: path=A/B".to_owned());
         }
@@ -163,6 +171,7 @@ impl FlightSpec {
             }
             Request::Path(path) => format!("{host}/{}", path.join("/")),
             Request::Ticket(_) => format!("{host}: a ticket"),
+            Request::Tables => format!("{host}: tables"),
         }
     }
 
@@ -172,6 +181,7 @@ impl FlightSpec {
         match (&self.name, &self.request) {
             (Some(name), _) => name.clone(),
             (None, Request::Path(path)) => path.last().cloned().unwrap_or_default(),
+            (None, Request::Tables) => "tables".to_owned(),
             (None, _) => "flight".to_owned(),
         }
     }
@@ -185,6 +195,7 @@ impl FlightSpec {
             Request::Sql(query) => format!("sql={}", encode(query)),
             Request::Path(path) => format!("path={}", encode(&path.join("/"))),
             Request::Ticket(ticket) => format!("ticket#{:016x}", fnv(ticket.as_bytes())),
+            Request::Tables => "tables".to_owned(),
         };
         let mut origin = format!(
             "{}://{}#{asked}",
@@ -212,6 +223,7 @@ impl FlightSpec {
             Request::Sql(query) => FlightOptions::sql(url, query.clone()),
             Request::Path(path) => FlightOptions::path(url, path.clone()),
             Request::Ticket(ticket) => FlightOptions::ticket(url, ticket.as_bytes().to_vec()),
+            Request::Tables => FlightOptions::sql_tables(url),
         };
         for (name, value) in &self.headers {
             options = options.header(name.clone(), header_value(value)?);
@@ -220,6 +232,41 @@ impl FlightSpec {
             .retry(RETRY_FIRST, RETRY_MOST)
             .connect(wake)
             .map_err(|e| e.to_string())
+    }
+}
+
+impl FlightSpec {
+    /// The table named by `catalog`, `schema` and `table` (as a list of tables gives them;
+    /// null parts left out) at the same service, with the same headers: all its rows, its
+    /// SQL table named after it.
+    pub(crate) fn table(
+        &self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+    ) -> FlightSpec {
+        // Each part quoted, a quote within doubled: names with spaces, dots or quotes stay
+        // whole.
+        // An empty catalog or schema is none, as servers without them say.
+        let quoted: Vec<String> = [catalog, schema, Some(table)]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+            .collect();
+        FlightSpec {
+            url: self.url.clone(),
+            request: Request::Sql(format!("SELECT * FROM {}", quoted.join("."))),
+            key: None,
+            headers: self.headers.clone(),
+            name: Some(table.to_owned()),
+            time: None,
+        }
+    }
+
+    /// Whether it lists a service's tables.
+    pub(crate) fn lists_tables(&self) -> bool {
+        self.request == Request::Tables
     }
 }
 
@@ -393,6 +440,53 @@ mod tests {
         assert!(
             error.ends_with("and time=COLUMN, unit=s and window=10m"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_flight_url_can_ask_for_the_list_of_tables() {
+        let spec = FlightSpec::parse("grpc://Host:1#tables&header=authorization:$T").unwrap();
+        assert!(spec.lists_tables());
+        assert_eq!(spec.title(), "Host:1: tables");
+        assert_eq!(spec.name_hint(), "tables");
+        assert_eq!(spec.origin(), "grpc://host:1#tables");
+        let both = FlightSpec::parse("grpc://h#tables&sql=SELECT 1").unwrap_err();
+        assert!(both.contains("not more"), "{both}");
+        let valued = FlightSpec::parse("grpc://h#tables=x").unwrap_err();
+        assert!(
+            valued.contains("unknown Flight option tables=..."),
+            "{valued}"
+        );
+        let nothing = FlightSpec::parse("grpc://h#key=a").unwrap_err();
+        assert!(nothing.ends_with("ticket=T or tables"), "{nothing}");
+        assert!(!FlightSpec::parse("grpc://h#sql=x").unwrap().lists_tables());
+    }
+
+    #[test]
+    fn a_listed_table_is_asked_for_by_its_quoted_name() {
+        let listing = FlightSpec::parse("grpc://h#tables&header=authorization:$T").unwrap();
+        let full = listing.table(Some("demo"), Some("public"), "requests");
+        assert_eq!(
+            full.request,
+            Request::Sql("SELECT * FROM \"demo\".\"public\".\"requests\"".to_owned())
+        );
+        assert_eq!(full.name.as_deref(), Some("requests"));
+        assert_eq!(full.headers, listing.headers, "the same token");
+        assert_eq!(full.url, listing.url);
+        let bare = listing.table(None, None, "odd \"name\".x");
+        assert_eq!(
+            bare.request,
+            Request::Sql("SELECT * FROM \"odd \"\"name\"\".x\"".to_owned())
+        );
+        let unnamed = listing.table(Some(""), Some(""), "t");
+        assert_eq!(
+            unnamed.request,
+            Request::Sql("SELECT * FROM \"t\"".to_owned())
+        );
+        let schema_only = listing.table(None, Some("s"), "t");
+        assert_eq!(
+            schema_only.request,
+            Request::Sql("SELECT * FROM \"s\".\"t\"".to_owned())
         );
     }
 

@@ -3,6 +3,7 @@
 //! while its sources change, its result updated in place.
 
 use std::error::Error;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,13 +13,15 @@ use densa_arrow::LiveModel;
 use densa_chart::{Axis, ChartModel};
 use densa_data::LiveTable;
 use densa_datafusion::{Engine, QueryEvent, QueryStream};
-use densa_ui::{Action, ActionKind, Align, EventCx, Style, Ui, WidgetId};
+use densa_ui::{Action, ActionKind, Align, EventCx, Length, Style, Ui, WidgetId};
 use densa_widgets::{
     Button, Chart, DockArea, DockAt, DockPanel, DockSide, Label, Panel, TextInput,
 };
 
 use crate::chart::Plotted;
 use crate::source::{grouped, Grid, Source};
+
+mod save;
 
 type ResultChart = Chart<Plotted>;
 
@@ -27,6 +30,8 @@ type ResultChart = Chart<Plotted>;
 const NUMBER: &str = "#";
 /// Rows shown at most: a larger result is cut off (its query cancelled).
 const MAX_ROWS: usize = 1_000_000;
+/// How wide the box naming a file to save the result in is, in logical pixels.
+const SAVE_AS_WIDTH: f32 = 270.0;
 /// How often a live query runs again, at most, while its sources change.
 pub(crate) const LIVE_EVERY: Duration = Duration::from_secs(1);
 
@@ -48,6 +53,13 @@ pub(crate) struct Query {
     /// Whether the query runs again while its sources change, and the button saying so.
     live: bool,
     live_button: WidgetId,
+    /// Where a file name is typed to save the result in.
+    save_as: WidgetId,
+    /// What the last save did, said after where the query stands until it runs again.
+    saved: Option<String>,
+    /// A save under way on a thread of its own: where to, how many rows, and its outcome
+    /// when done.
+    saving: Option<Saving>,
     /// The query last run from the input (a live query runs it again, not what is being
     /// typed).
     ran: String,
@@ -64,6 +76,9 @@ pub(crate) struct Query {
     /// Rows shown at most ([`MAX_ROWS`]; fewer in tests).
     max_rows: usize,
 }
+
+/// A save under way: where to, how many rows, and its outcome when done.
+type Saving = (String, usize, Receiver<Result<usize, String>>);
 
 /// A run in place of the last one's result: its rows replace those of the same number as
 /// they come, rows past its last are deleted when it ends, and its chart, made aside, takes
@@ -95,6 +110,9 @@ impl Query {
         let input = TextInput::new(query).with_placeholder("SELECT ... FROM a source, then Enter");
         let input = ui.add(bar, input, Style::row().grow(1.0))?;
         let live_button = ui.add(bar, Button::new(live_label(live)), Style::row().shrink(0.0))?;
+        let save_as = TextInput::new("").with_placeholder("Save as result.csv or .parquet");
+        let width = Style::row().shrink(0.0).width(Length::Px(SAVE_AS_WIDTH));
+        let save_as = ui.add(bar, save_as, width)?;
         let model = LiveModel::new(LiveTable::new(waiting(), NUMBER)?)?;
         let grid = ui.add(body, Grid::new(model), Grid::style())?;
         let line = Style::row().padding(4.0).shrink(0.0);
@@ -125,6 +143,9 @@ impl Query {
             started: Instant::now(),
             live,
             live_button,
+            save_as,
+            saved: None,
+            saving: None,
             ran: String::new(),
             refresh: None,
             shown: None,
@@ -203,11 +224,13 @@ impl Query {
         if !again {
             // A run again keeps saying where the last one ended: no word each second.
             self.state = format!("Running{}", self.unseen);
+            self.saved = None;
         }
     }
 
     /// Takes in what the query has sent, until `deadline`. Whether some is left.
     pub(crate) fn take(&mut self, ui: &mut Ui, deadline: Instant) -> bool {
+        self.finish_save(ui);
         loop {
             let Some(stream) = self.stream.as_mut() else {
                 return false;
@@ -402,18 +425,92 @@ impl Query {
     /// Follows what happened to the result's grid and chart: a row selected in the grid is
     /// marked on the chart, and a chart the user moved stays where they put it, until it
     /// shows all of the result again.
-    pub(crate) fn action(&mut self, ui: &mut Ui, action: &Action) {
+    /// Takes in what the user did; `wake` is called when work it starts in the background
+    /// (a save) is done.
+    pub(crate) fn action(
+        &mut self,
+        ui: &mut Ui,
+        action: &Action,
+        wake: impl Fn() + Send + 'static,
+    ) {
         if action.source == self.grid && matches!(action.kind, ActionKind::Selected(_)) {
             self.mark_selected(ui);
         } else if action.source == self.chart && action.kind == ActionKind::Changed {
             let chart = ui.widget::<ResultChart>(self.chart);
             self.fit = chart.is_some_and(shows_all);
+        } else if action.source == self.save_as && action.kind == ActionKind::Submitted {
+            self.save(ui, wake);
         } else if action.source == self.live_button && action.kind == ActionKind::Clicked {
             self.live = !self.live;
             let label = live_label(self.live);
             ui.update::<Button, _>(self.live_button, |button, cx| button.set_label(cx, label));
             self.show_status(ui);
         }
+    }
+
+    /// Saves the result, as the grid shows it, in the file named in the save box.
+    pub(crate) fn save(&mut self, ui: &mut Ui, wake: impl Fn() + Send + 'static) {
+        if self.saving.is_some() {
+            self.saved = Some("still saving the last result".to_owned());
+            return self.show_status(ui);
+        }
+        let name = ui
+            .widget::<TextInput>(self.save_as)
+            .map(|input| input.text().trim().trim_matches('"').to_owned())
+            .unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+        let job = match (&self.shown, ui.widget::<Grid>(self.grid)) {
+            (None, _) | (_, None) => Err("there is no result yet".to_owned()),
+            (Some(shown), Some(grid)) => match grid.model().view() {
+                Some(view) => {
+                    // The query's own columns: not the row numbers.
+                    let columns = shown.fields().iter().filter(|f| f.name() != NUMBER);
+                    let columns = Schema::new(columns.cloned().collect::<Vec<_>>());
+                    let path = std::path::Path::new(&name);
+                    save::Job::new(grid.model().table(), view, &columns, path)
+                }
+                None => Err("there is no result yet".to_owned()),
+            },
+        };
+        match job {
+            Ok(job) => {
+                let (to, rows) = (job.path.display().to_string(), job.rows());
+                let (done, outcome) = mpsc::channel();
+                let started = std::thread::Builder::new()
+                    .name("save result".to_owned())
+                    .spawn(move || {
+                        let _ = done.send(job.run());
+                        wake();
+                    });
+                match started {
+                    Ok(_) => {
+                        self.saved = Some(format!("saving {} rows to {to}", grouped(rows as u64)));
+                        self.saving = Some((to, rows, outcome));
+                    }
+                    Err(error) => self.saved = Some(format!("not saved: {error}")),
+                }
+            }
+            Err(error) => self.saved = Some(format!("not saved: {error}")),
+        }
+        self.show_status(ui);
+    }
+
+    /// Takes in the outcome of a save, if it has ended.
+    fn finish_save(&mut self, ui: &mut Ui) {
+        let Some((to, _, outcome)) = &self.saving else {
+            return;
+        };
+        let saved = match outcome.try_recv() {
+            Ok(Ok(rows)) => format!("saved {} rows to {to}", grouped(rows as u64)),
+            Ok(Err(error)) => format!("not saved: {error}"),
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => "not saved: the save stopped".to_owned(),
+        };
+        self.saved = Some(saved);
+        self.saving = None;
+        self.show_status(ui);
     }
 
     /// Marks the grid's selected row on the chart, moving the chart to it if it is out of
@@ -444,6 +541,10 @@ impl Query {
             .widget::<Grid>(self.grid)
             .map_or(0, |grid| grid.model().table().len());
         let mut text = format!("{}: {} rows", self.state, grouped(rows as u64));
+        if let Some(saved) = &self.saved {
+            text.push_str("; ");
+            text.push_str(saved);
+        }
         if self.live {
             text.push_str("; live, run again each second while its sources change");
         }

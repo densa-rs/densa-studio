@@ -106,13 +106,16 @@ impl Studio {
     /// Opens `text`, a file's path or a stream's or Flight service's URL, as a new source in
     /// a tab beside the other sources; one already open has its tab shown instead.
     fn open(&mut self, ui: &mut Ui, text: &str) {
+        match Opening::read(text) {
+            Ok(what) => self.open_what(ui, what),
+            Err(error) => self.problem(format!("{} not opened: {error}", shown(text))),
+        }
+    }
+
+    /// Opens `what` as [`open`](Self::open) does.
+    fn open_what(&mut self, ui: &mut Ui, what: Opening) {
         let (Some(ids), Some(waker)) = (self.ids, self.waker.clone()) else {
             return;
-        };
-        let what = Opening::read(text);
-        let what = match what {
-            Ok(what) => what,
-            Err(error) => return self.problem(format!("{} not opened: {error}", shown(text))),
         };
         let origin = what.origin();
         if let Some(open) = self
@@ -143,7 +146,7 @@ impl Studio {
                     let _ = DockArea::remove_panel(ui, ids.dock, welcome);
                 }
             }
-            Err(error) => self.problem(format!("{} not opened: {error}", shown(text))),
+            Err(error) => self.problem(format!("{} not opened: {error}", what.shown())),
         }
     }
 
@@ -313,7 +316,12 @@ impl App for Studio {
             return;
         };
         if let Some(query) = &mut self.query {
-            query.action(ui, &action);
+            let waker = self.waker.clone();
+            query.action(ui, &action, move || {
+                if let Some(waker) = &waker {
+                    waker.wake();
+                }
+            });
         }
         let submitted = action.kind == ActionKind::Submitted;
         if submitted {
@@ -338,6 +346,16 @@ impl App for Studio {
         {
             self.query_pending = false;
             self.run_query(ui, false);
+        } else if let Some(table) = self
+            .sources
+            .iter()
+            .filter(|_| submitted)
+            .find(|s| s.grid == action.source)
+            .and_then(|s| s.selected_table(ui))
+        {
+            // A table chosen from a list of a service's tables: open it.
+            self.open_what(ui, Opening::Flight(table));
+            self.save(ui);
         } else if action.source == ids.dock
             && matches!(action.kind, ActionKind::Changed | ActionKind::Selected(_))
         {
@@ -420,6 +438,16 @@ impl Opening {
                 .map(|p| p.display().to_string()),
             Self::Stream(spec) => Some(spec.origin()),
             Self::Flight(spec) => Some(spec.origin()),
+        }
+    }
+
+    /// What a message about it says: a file's path as given, a remote source's title (its
+    /// host and what is asked, never a header).
+    fn shown(&self) -> String {
+        match self {
+            Self::File(path) => path.display().to_string(),
+            Self::Stream(spec) => spec.title(),
+            Self::Flight(spec) => spec.title(),
         }
     }
 

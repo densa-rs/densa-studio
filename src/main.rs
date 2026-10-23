@@ -37,6 +37,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     if args.sample {
         let requests = sample::path(|| eprintln!("Writing the sample requests (once)..."))?;
         sources.push(requests.display().to_string());
+        let flight = samples::flight_server()?;
+        sources.push(format!("{flight}#tables"));
         let readings = samples::readings_server()?;
         // Every reading of the last minute, then each sensor's latest (in front, as its
         // values change in place).

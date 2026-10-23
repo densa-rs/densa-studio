@@ -16,6 +16,9 @@ publish = false
 # Arrow 60, as densa uses.
 arrow-array = "60"
 arrow-cast = "60"
+# Writing a query's result as CSV, and gathering its rows in the grid's order.
+arrow-csv = { version = "60", default-features = false }
+arrow-select = "60"
 arrow-schema = "60"
 parquet = { version = "60", default-features = false, features = ["arrow"] }
 # densa from crates.io; its connectors from their main branch until they are released
@@ -31,15 +34,15 @@ densa-datafusion = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-files = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-flight = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-ws = { git = "https://github.com/densa-rs/densa-connectors" }
-# The connectors' sample web requests and sensor stream, for --sample.
-samples = { git = "https://github.com/densa-rs/densa-connectors" }
+# The connectors' sample web requests, sensor stream and Flight service, for --sample.
+samples = { git = "https://github.com/densa-rs/densa-connectors", features = ["flight"] }
 
 [dev-dependencies]
 # Text without the system's fonts, for tests of the panels.
 densa-paragraph = { version = "0.2.1", default-features = false }
 densa-text = "0.2.1"
-# A Flight service to read in tests.
-samples = { git = "https://github.com/densa-rs/densa-connectors", features = ["flight"] }
+# The grid's model, prepared as a paint does, for tests that choose rows.
+densa-grid = "0.2.1"
 
 [lints.rust]
 unsafe_code = "forbid"

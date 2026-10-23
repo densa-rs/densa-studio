@@ -88,7 +88,7 @@ fn the_chart_shows_the_whole_result_until_the_user_moves_it() {
     ui.update::<ResultChart, _>(query.chart, |chart, cx| {
         chart.show(cx, Axis::number(10.0, 20.0));
     });
-    query.action(&mut ui, &moved);
+    query.action(&mut ui, &moved, || {});
     take(&mut ui, &mut query, rows(4, &[100], &[1.0]));
     let (start, end) = chart(&ui, &query);
     assert!(
@@ -100,7 +100,7 @@ fn the_chart_shows_the_whole_result_until_the_user_moves_it() {
     ui.update::<ResultChart, _>(query.chart, |chart, cx| {
         chart.show(cx, Axis::number(-10.0, 110.0));
     });
-    query.action(&mut ui, &moved);
+    query.action(&mut ui, &moved, || {});
     take(&mut ui, &mut query, rows(5, &[200], &[1.0]));
     let (start, end) = chart(&ui, &query);
     assert!(
@@ -127,7 +127,7 @@ fn the_row_selected_in_the_grid_is_marked_and_brought_into_sight() {
             source: query.grid,
             kind: ActionKind::Selected(row.unwrap_or(0)),
         };
-        query.action(ui, &selected);
+        query.action(ui, &selected, || {});
         ui.widget::<ResultChart>(query.chart)
             .unwrap()
             .model()
@@ -158,7 +158,7 @@ fn a_view_must_reach_both_ends_to_fit_again_and_a_new_result_always_does() {
     ui.update::<ResultChart, _>(query.chart, |chart, cx| {
         chart.show(cx, Axis::number(16.0, 21.0));
     });
-    query.action(&mut ui, &moved);
+    query.action(&mut ui, &moved, || {});
     assert!(!query.fit, "the start is out of sight");
 
     query.replace(&mut ui, rows(0, &[], &[]).schema()).unwrap();
@@ -190,7 +190,7 @@ fn a_new_result_clears_the_mark_and_an_empty_one_says_so() {
         source: query.grid,
         kind: ActionKind::Selected(1),
     };
-    query.action(&mut ui, &selected);
+    query.action(&mut ui, &selected, || {});
     let mark = |ui: &Ui, query: &Query| {
         ui.widget::<ResultChart>(query.chart)
             .unwrap()
@@ -332,7 +332,7 @@ fn a_live_query_runs_again_when_a_source_changed_a_while_after_its_last_run() {
         source: query.live_button,
         kind: ActionKind::Clicked,
     };
-    query.action(&mut ui, &click);
+    query.action(&mut ui, &click, || {});
     assert!(query.is_live());
     assert_eq!(
         ui.widget::<Button>(query.live_button).unwrap().label(),
@@ -345,7 +345,7 @@ fn a_live_query_runs_again_when_a_source_changed_a_while_after_its_last_run() {
     query.ended -= LIVE_EVERY;
     query.ran.clear();
     assert!(!query.is_due(true), "nothing has run");
-    query.action(&mut ui, &click);
+    query.action(&mut ui, &click, || {});
     assert_eq!(
         ui.widget::<Button>(query.live_button).unwrap().label(),
         "Live: off"
@@ -446,9 +446,132 @@ fn a_live_query_does_not_run_again_while_it_runs_and_a_run_forgets_the_last_fail
     query.ended -= LIVE_EVERY;
     assert!(query.is_due(false), "a failed run runs again");
     let engine = Engine::new().unwrap();
+    query.saved = Some("saved 1 rows to x.csv".to_owned());
     query.run(&mut ui, &engine, &mut [], || {}, true);
     assert!(query.is_running());
     assert!(!query.retry, "this run is the retry");
+    assert!(query.saved.is_some(), "a live run again keeps the word");
+    ui.update::<TextInput, _>(query.input, |input, cx| input.set_text(cx, "SELECT 2"));
+    query.run(&mut ui, &engine, &mut [], || {}, false);
+    assert!(query.saved.is_none(), "a run of one's own starts afresh");
     query.ended -= LIVE_EVERY;
     assert!(!query.is_due(true), "not while it runs");
+}
+
+/// The SQL panel's status line.
+fn status(ui: &Ui, query: &Query) -> String {
+    ui.widget::<Label>(query.status).unwrap().text().to_owned()
+}
+
+/// Saves as the save box asks, and waits for the save to end as frames would.
+fn save_and_wait(ui: &mut Ui, query: &mut Query) {
+    query.save(ui, || {});
+    let until = Instant::now() + Duration::from_secs(10);
+    while query.saving.is_some() && Instant::now() < until {
+        query.take(ui, Instant::now());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_result_is_saved_in_the_file_named_beside_the_query() {
+    let (mut ui, mut query) = panel(&[1, 2, 3], &[0.5, 1.5, 2.5]);
+    frame(&mut ui);
+    let folder = std::env::temp_dir().join(format!("densa-studio-saved-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("out.csv");
+    let name = path.display().to_string();
+
+    save_and_wait(&mut ui, &mut query);
+    assert!(
+        !status(&ui, &query).contains("sav"),
+        "no name, nothing done"
+    );
+    ui.update::<TextInput, _>(query.save_as, |input, cx| {
+        input.set_text(cx, format!(" \"{name}\" "))
+    });
+    query.save(&mut ui, || {});
+    let status_now = status(&ui, &query);
+    assert!(
+        status_now.ends_with(&format!("; saving 3 rows to {name}")),
+        "{status_now}"
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    while query.saving.is_some() && Instant::now() < until {
+        query.take(&mut ui, Instant::now());
+    }
+    let status_now = status(&ui, &query);
+    assert!(
+        status_now.ends_with(&format!("; saved 3 rows to {name}")),
+        "{status_now}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "x,y\n1,0.5\n2,1.5\n3,2.5\n"
+    );
+
+    save_and_wait(&mut ui, &mut query);
+    let status_now = status(&ui, &query);
+    assert!(
+        status_now.ends_with(&format!("; not saved: {name} exists: choose another name")),
+        "{status_now}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "x,y\n1,0.5\n2,1.5\n3,2.5\n",
+        "kept"
+    );
+
+    ui.update::<TextInput, _>(query.save_as, |input, cx| input.set_text(cx, "out.json"));
+    save_and_wait(&mut ui, &mut query);
+    assert!(status(&ui, &query).ends_with("; not saved: name a .parquet or .csv file"));
+}
+
+#[test]
+fn a_relative_name_is_saved_under_the_current_folder_and_said_in_full() {
+    let (mut ui, mut query) = panel(&[1], &[0.5]);
+    frame(&mut ui);
+    let name = format!("densa-studio-relative-{}.csv", std::process::id());
+    let full = std::env::current_dir().unwrap().join(&name);
+    let _ = std::fs::remove_file(&full);
+    ui.update::<TextInput, _>(query.save_as, |input, cx| input.set_text(cx, name.clone()));
+    save_and_wait(&mut ui, &mut query);
+    let saved = full.exists();
+    let _ = std::fs::remove_file(&full);
+    assert!(saved);
+    let status_now = status(&ui, &query);
+    assert!(
+        status_now.ends_with(&format!("; saved 1 rows to {}", full.display())),
+        "{status_now}"
+    );
+}
+
+#[test]
+fn a_second_save_waits_for_the_first() {
+    let (mut ui, mut query) = panel(&[1], &[0.5]);
+    frame(&mut ui);
+    let (_never_sent, outcome) = mpsc::channel();
+    query.saving = Some(("elsewhere".to_owned(), 1, outcome));
+    ui.update::<TextInput, _>(query.save_as, |input, cx| input.set_text(cx, "x.csv"));
+    query.save(&mut ui, || {});
+    assert!(status(&ui, &query).ends_with("; still saving the last result"));
+    query.take(&mut ui, Instant::now());
+    assert!(query.saving.is_some(), "nothing came: still saving");
+    drop(_never_sent);
+    query.take(&mut ui, Instant::now());
+    assert!(status(&ui, &query).ends_with("; not saved: the save stopped"));
+    assert!(query.saving.is_none());
+}
+
+#[test]
+fn there_is_nothing_to_save_before_a_result() {
+    let mut ui = Ui::new(TextSystem::bundled().unwrap());
+    let dock = ui
+        .add(ui.root(), DockArea::new(), DockArea::style())
+        .unwrap();
+    let mut query = Query::add(&mut ui, dock, DockAt::First, "", false).unwrap();
+    ui.update::<TextInput, _>(query.save_as, |input, cx| input.set_text(cx, "out.csv"));
+    save_and_wait(&mut ui, &mut query);
+    assert!(status(&ui, &query).ends_with("; not saved: there is no result yet"));
 }

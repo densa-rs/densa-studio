@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use densa_arrow::LiveModel;
 use densa_data::LiveTable;
@@ -145,6 +145,8 @@ pub(crate) struct Source {
     time_off: Option<String>,
     /// Why the window could not keep the table, if it could not.
     window_off: Option<String>,
+    /// For a list of a Flight SQL service's tables: what was asked, to ask for a table.
+    listing: Option<FlightSpec>,
     /// Rows in batches the table refused, and why the last one was.
     skipped: u64,
     refused: Option<String>,
@@ -235,6 +237,7 @@ impl Source {
         };
         let mut source = Self::new(name, origin, panel, grid, feed);
         source.time = spec.time.clone();
+        source.listing = spec.lists_tables().then(|| spec.clone());
         // Nothing for SQL until its columns come.
         source.changed = false;
         Ok(source)
@@ -250,6 +253,7 @@ impl Source {
             time: None,
             time_off: None,
             window_off: None,
+            listing: None,
             skipped: 0,
             refused: None,
             changed: true,
@@ -432,6 +436,17 @@ impl Source {
         }
     }
 
+    /// For a list of tables, the table in its selected row, to open: the same service and
+    /// headers.
+    pub(crate) fn selected_table(&self, ui: &Ui) -> Option<FlightSpec> {
+        let listing = self.listing.as_ref()?;
+        let grid = ui.widget::<Grid>(self.grid)?;
+        let model = grid.model();
+        let at = model.table().row_of(model.record(grid.selected()?)?)?;
+        let (catalog, schema, table) = listed(&model.table().batches()[at.batch], at.row)?;
+        Some(listing.table(catalog.as_deref(), schema.as_deref(), &table))
+    }
+
     /// The rows taken in so far.
     pub(crate) fn rows(&self, ui: &Ui) -> usize {
         ui.widget::<Grid>(self.grid)
@@ -448,6 +463,13 @@ impl Source {
             } => format!("{}: reading, {rows} of {}", self.name, grouped(*total)),
             Feed::File { .. } => format!("{}: reading, {rows} rows", self.name),
             Feed::Stream { live, .. } => format!("{}: {}, {rows} rows", self.name, live.status()),
+            Feed::Flight { fetch, .. } if self.listing.is_some() => {
+                format!(
+                    "{}: {}, {rows} tables (Enter opens the selected one)",
+                    self.name,
+                    fetch.status()
+                )
+            }
             Feed::Flight { fetch, .. } => {
                 format!("{}: {}, {rows} rows", self.name, fetch.status())
             }
@@ -494,6 +516,22 @@ impl Source {
         let batches = table.snapshot().map_err(|e| e.to_string())?;
         Ok((table.schema().clone(), batches))
     }
+}
+
+/// The catalog, schema and name of the table in `row` of a list of tables (as Flight SQL
+/// lists them); `None` without a name. Values of any type are read as text.
+pub(crate) fn listed(
+    batch: &RecordBatch,
+    row: usize,
+) -> Option<(Option<String>, Option<String>, String)> {
+    let text = |name: &str| -> Option<String> {
+        let column = batch.column_by_name(name)?.slice(row, 1);
+        let column = arrow_cast::cast(&column, &DataType::Utf8).ok()?;
+        let column = column.as_any().downcast_ref::<arrow_array::StringArray>()?;
+        column.is_valid(0).then(|| column.value(0).to_owned())
+    };
+    let table = text("table_name")?;
+    Some((text("catalog_name"), text("db_schema_name"), table))
 }
 
 /// Adds a tab titled `title` showing `table` to `dock`, placed `at`, keyed by `origin`.

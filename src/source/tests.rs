@@ -291,6 +291,61 @@ mod flights {
     }
 
     #[test]
+    fn a_listed_table_needs_a_name_and_any_type_reads_as_text() {
+        let column = |values: Vec<Option<&str>>| {
+            Arc::new(arrow_array::StringArray::from(values)) as arrow_array::ArrayRef
+        };
+        let batch = RecordBatch::try_from_iter([
+            ("catalog_name", column(vec![None, Some("c")])),
+            ("db_schema_name", column(vec![Some("s"), None])),
+            ("table_name", column(vec![Some("t"), None])),
+        ])
+        .unwrap();
+        assert_eq!(
+            listed(&batch, 0),
+            Some((None, Some("s".into()), "t".into()))
+        );
+        assert_eq!(listed(&batch, 1), None, "no name: nothing to open");
+        let numbered = RecordBatch::try_from_iter([(
+            "table_name",
+            Arc::new(arrow_array::Int64Array::from(vec![7])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        assert_eq!(listed(&numbered, 0), Some((None, None, "7".into())));
+        let unnamed = RecordBatch::try_from_iter([("name", column(vec![Some("t")]))]).unwrap();
+        assert_eq!(listed(&unnamed, 0), None, "no table_name column");
+    }
+
+    #[test]
+    fn a_list_of_tables_opens_the_selected_one() {
+        let url = samples::flight_server_of(10).unwrap();
+        let (mut ui, source) = read(&format!("{url}#tables"));
+        assert_eq!(source.rows(&ui), 1);
+        let status = source.status(&ui);
+        assert!(
+            status.ends_with("1 tables (Enter opens the selected one)"),
+            "{status}"
+        );
+        assert!(source.selected_table(&ui).is_none(), "none selected yet");
+        // As a paint does before the user can choose a row.
+        ui.update::<Grid, _>(source.grid, |grid, cx| {
+            densa_grid::GridModel::prepare(grid.model_mut(cx));
+            grid.select(cx, Some(0));
+        });
+        let table = source.selected_table(&ui).unwrap();
+        assert_eq!(table.name_hint(), "requests");
+        assert_eq!(
+            table.origin(),
+            format!("{url}#sql=SELECT%20*%20FROM%20\"demo\".\"public\".\"requests\"&name=requests")
+        );
+
+        // The table opens as any Flight SQL query does.
+        let (ui, opened) = read(&format!("{url}#sql=SELECT * FROM requests"));
+        assert_eq!(opened.rows(&ui), 10);
+        assert!(opened.selected_table(&ui).is_none(), "not a list of tables");
+    }
+
+    #[test]
     fn a_window_keeps_the_newest_rows_by_their_time() {
         let url = samples::flight_server_of(100).unwrap();
         // Requests are 37 ms apart: a second holds the newest and 27 before it.

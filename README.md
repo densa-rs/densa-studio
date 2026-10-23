@@ -24,7 +24,8 @@ densa-studio trips.parquet zones.csv
 densa-studio --sample        # a million sample web requests (written to your cache
                              # folder the first time) and a local stream of 500 sensors:
                              # `readings` (each sensor's latest) and `recent` (the last minute),
-                             # their `time` column as timestamps
+                             # their `time` column as timestamps, and a local Flight SQL
+                             # service's list of tables
 densa-studio "wss://example.com/trades#key=id"
 densa-studio "grpc+tls://flight.example.com:443#sql=SELECT * FROM trips&header=authorization:Bearer $TOKEN"
 ```
@@ -74,16 +75,24 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   status bar names it: `(last 10m by time)`.
 - **Arrow Flight.** A `grpc://` or `grpc+tls://` URL opens a Flight service's data in a tab
   that fills as it arrives. After `#`, say what to ask for: `sql=QUERY` (a Flight SQL
-  server), `path=A/B` (a dataset by its path) or `ticket=T`; `key=COLUMN` keeps the latest
+  server), `path=A/B` (a dataset by its path) or `ticket=T`. `key=COLUMN` keeps the latest
   row of each key (without one, rows are numbered), and `name=TABLE` names its table for
   SQL. A service that cannot be reached is asked again, with waits that grow; the status bar
   says so, and the first query does not wait for it.
+- **Browsing a Flight SQL server.** `#tables` lists the server's tables (catalog, schema,
+  name and type); Enter or a double click on one opens all its rows in a tab of its own,
+  with the same headers.
 - **Headers, without writing secrets down.** Streams and Flight sources take
   `header=NAME:VALUE` after `#`, any number of times; `$NAME` (or `${NAME}`) in a value is
   read from that environment variable when the source opens, so
   `header=authorization:Bearer $TOKEN` sends a token that is never typed, shown, or kept in
   the saved arrangement (`$$` is a `$`). A user and password in a URL are refused: they go
   in a header. Write `&`, `#` and `%` in option values as `%26`, `%23` and `%25`.
+- **Saving a result.** Type a file name in the box beside the query and press Enter: the
+  result is written as the grid shows it (in its sort, without the `#` row numbers), as
+  Parquet or CSV by the name's extension, while you go on working. A name without a folder
+  goes in the folder Studio was started from; the status bar says where the file went. A
+  file that is already there is never written over.
 - **Live SQL.** The Live button beside the query (or `--live`) runs the last query again each
   second while its sources change: its result is updated in place (the selected row and the
   sort stay) and the chart moves with it.
@@ -98,8 +107,8 @@ sources change, `--light` for the light theme, `--seconds N` closes after N seco
 
 ## Next
 
-Browsing what a Flight SQL server has; saving query results; opening files by dropping them
-on the window; bar charts of text categories and picking the charted columns without SQL.
+Opening files by dropping them on the window; a listed table's columns before opening it;
+bar charts of text categories and picking the charted columns without SQL.
 
 ## License
 

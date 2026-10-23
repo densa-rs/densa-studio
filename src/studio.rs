@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use densa_datafusion::Engine;
 use densa_ui::{Action, ActionKind, Align, Style, Theme, Ui, WidgetId};
 use densa_widgets::{DockArea, DockAt, DockLayout, DockSide, Label, Panel, TextInput};
-use densa_window::{App, Host, Waker};
+use densa_window::{App, FileDrop, Host, Waker};
 
 use crate::config;
 use crate::flight::FlightSpec;
@@ -23,12 +23,28 @@ const FRAME_BUDGET: Duration = Duration::from_millis(6);
 /// The part of it a query's result gets first, so it shows while files still load.
 const QUERY_BUDGET: Duration = Duration::from_millis(2);
 /// What the welcome tab says.
-const WELCOME: &str = "Open a CSV or Parquet file, or a WebSocket stream: type its path or \
-                       ws:// URL in the box above and press Enter, or start Studio with them. \
-                       Each opens in a tab of its own that fills as rows come, and the SQL \
-                       panel queries every one by its name. After a stream's URL, #key=COLUMN \
-                       keeps the latest row of each key, #arrow reads Arrow IPC instead of \
-                       JSON, and #subscribe=TEXT sends TEXT when it connects.";
+const WELCOME: &str = "Open a CSV or Parquet file, a ws:// stream or a grpc:// Flight \
+                       service: type its path or URL in the box above and press Enter, drop \
+                       files on the window, or start Studio with them. Each opens in a tab of \
+                       its own that fills as rows come, and the SQL panel queries every one \
+                       by its name. After a URL's #, key=COLUMN keeps the latest row of each \
+                       key, time=COLUMN shows its times as times, and tables lists a Flight \
+                       SQL server's tables.";
+
+/// Files named in the status bar while held over the window, at most.
+const HOVER_NAMES: usize = 3;
+
+/// `names` as the status bar lists them: the first few, then how many more.
+fn listed(names: &[String]) -> String {
+    match names.len() {
+        0..=HOVER_NAMES => names.join(", "),
+        n => format!(
+            "{} and {} more",
+            names[..HOVER_NAMES].join(", "),
+            n - HOVER_NAMES
+        ),
+    }
+}
 
 /// What Studio starts with.
 pub(crate) struct Start {
@@ -57,6 +73,9 @@ pub(crate) struct Studio {
     layout_file: Option<PathBuf>,
     /// The last thing to tell the user.
     note: String,
+    /// Names of the files held over the window, said before anything else until they are
+    /// dropped or leave.
+    hovering: Vec<String>,
     /// What went wrong, until the user does something else: shown before any note.
     problems: Vec<String>,
     /// The first query runs once the files have loaded.
@@ -89,6 +108,7 @@ impl Studio {
             welcome: None,
             layout_file: config::layout_file(),
             note: String::new(),
+            hovering: Vec::new(),
             problems: Vec::new(),
             status_at: Instant::now(),
             wake_at: None,
@@ -114,9 +134,11 @@ impl Studio {
 
     /// Opens `what` as [`open`](Self::open) does.
     fn open_what(&mut self, ui: &mut Ui, what: Opening) {
-        let (Some(ids), Some(waker)) = (self.ids, self.waker.clone()) else {
+        let Some(ids) = self.ids else {
             return;
         };
+        // Without one (in tests), nothing is woken: frames come anyway.
+        let waker = self.waker.clone();
         let origin = what.origin();
         if let Some(open) = self
             .sources
@@ -135,7 +157,9 @@ impl Studio {
             (None, None, None) => DockAt::First,
         };
         let wake = move || {
-            waker.wake();
+            if let Some(waker) = &waker {
+                waker.wake();
+            }
         };
         match what.open(ui, ids.dock, &taken, at, wake) {
             Ok(source) => {
@@ -234,7 +258,9 @@ impl Studio {
             .filter(|s| !s.is_done())
             .map(|s| s.status(ui))
             .collect();
-        let text = if !self.problems.is_empty() {
+        let text = if !self.hovering.is_empty() {
+            format!("Drop to open {}", listed(&self.hovering))
+        } else if !self.problems.is_empty() {
             self.problems.join("   ")
         } else if !loading.is_empty() {
             loading.join("   ")
@@ -251,12 +277,10 @@ impl Studio {
     }
 }
 
-impl App for Studio {
-    fn build(&mut self, ui: &mut Ui, host: &mut Host<'_>) -> Result<(), Box<dyn Error>> {
-        if self.start.light {
-            ui.set_theme(Theme::light());
-        }
-        self.waker = Some(host.waker());
+impl Studio {
+    /// Fills the window: the toolbar, the dock with the start's sources and query, the
+    /// status bar; then the arrangement saved last time, unless starting fresh.
+    fn lay_out(&mut self, ui: &mut Ui) -> Result<(), Box<dyn Error>> {
         let root = ui.root();
         let bar = Style::row()
             .padding(8.0)
@@ -309,6 +333,44 @@ impl App for Studio {
         ui.set_focus(Some(open));
         self.show_status(ui);
         Ok(())
+    }
+
+    /// Takes in a file dragged over the window or dropped on it.
+    fn dropped(&mut self, ui: &mut Ui, drop: FileDrop) {
+        match drop {
+            FileDrop::Hovering(path) => {
+                let name = path.file_name().unwrap_or(path.as_os_str());
+                self.hovering.push(name.to_string_lossy().into_owned());
+            }
+            FileDrop::Left => self.hovering.clear(),
+            FileDrop::Dropped(path) => {
+                // The first file of a drop starts afresh (the files dropped with it come
+                // after, the hover list empty by then): what went wrong before is old news.
+                if !self.hovering.is_empty() {
+                    self.hovering.clear();
+                    self.problems.clear();
+                }
+                // A dropped file is opened as one typed in the box is.
+                self.open_what(ui, Opening::File(path));
+                self.save(ui);
+            }
+            _ => {}
+        }
+        self.show_status(ui);
+    }
+}
+
+impl App for Studio {
+    fn file_drop(&mut self, ui: &mut Ui, _: &mut Host<'_>, drop: FileDrop) {
+        self.dropped(ui, drop);
+    }
+
+    fn build(&mut self, ui: &mut Ui, host: &mut Host<'_>) -> Result<(), Box<dyn Error>> {
+        if self.start.light {
+            ui.set_theme(Theme::light());
+        }
+        self.waker = Some(host.waker());
+        self.lay_out(ui)
     }
 
     fn action(&mut self, ui: &mut Ui, _: &mut Host<'_>, action: Action) {
@@ -505,7 +567,95 @@ fn shown(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use densa_paragraph::TextSystem;
+
     use super::*;
+
+    /// A Studio laid out with no window, keeping no arrangement.
+    fn studio() -> (Ui, Studio) {
+        let start = Start {
+            sources: Vec::new(),
+            query: None,
+            live: false,
+            light: false,
+            fresh: true,
+            close_at: None,
+        };
+        let mut studio = Studio::new(start).unwrap();
+        studio.layout_file = None;
+        let mut ui = Ui::new(TextSystem::bundled().unwrap());
+        ui.resize(densa_draw::Size::new(1_000.0, 700.0));
+        studio.lay_out(&mut ui).unwrap();
+        (ui, studio)
+    }
+
+    #[test]
+    fn many_files_held_are_counted_past_the_first_few() {
+        let names = |n: usize| (0..n).map(|i| format!("f{i}")).collect::<Vec<_>>();
+        assert_eq!(listed(&names(1)), "f0");
+        assert_eq!(listed(&names(3)), "f0, f1, f2");
+        assert_eq!(listed(&names(5)), "f0, f1, f2 and 2 more");
+    }
+
+    fn status(ui: &Ui, studio: &Studio) -> String {
+        let status = studio.ids.unwrap().status;
+        ui.widget::<Label>(status).unwrap().text().to_owned()
+    }
+
+    #[test]
+    fn files_held_over_the_window_are_named_and_a_dropped_one_opens() {
+        let folder = std::env::temp_dir().join(format!("densa-studio-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let (csv, text) = (folder.join("dropped.csv"), folder.join("notes.txt"));
+        std::fs::write(
+            &csv, "a,b
+1,2
+",
+        )
+        .unwrap();
+        std::fs::write(&text, "hello").unwrap();
+        let (mut ui, mut studio) = studio();
+
+        studio.dropped(&mut ui, FileDrop::Hovering(csv.clone()));
+        studio.dropped(&mut ui, FileDrop::Hovering(text.clone()));
+        assert_eq!(status(&ui, &studio), "Drop to open dropped.csv, notes.txt");
+        studio.dropped(&mut ui, FileDrop::Left);
+        assert!(
+            !status(&ui, &studio).starts_with("Drop"),
+            "{}",
+            status(&ui, &studio)
+        );
+
+        studio.dropped(&mut ui, FileDrop::Hovering(csv.clone()));
+        studio.dropped(&mut ui, FileDrop::Dropped(csv));
+        assert!(
+            !status(&ui, &studio).starts_with("Drop"),
+            "dropped: no longer held"
+        );
+        assert_eq!(studio.sources.len(), 1);
+        assert_eq!(studio.sources[0].name, "dropped");
+        assert!(studio.welcome.is_none(), "the welcome tab gives way");
+
+        studio.dropped(&mut ui, FileDrop::Dropped(text.clone()));
+        assert_eq!(studio.sources.len(), 1);
+        let said = status(&ui, &studio);
+        assert!(said.contains("notes.txt not opened"), "{said}");
+
+        // Two files dropped at once: the first one's trouble stays when the second opens.
+        let other = folder.join("other.csv");
+        std::fs::write(&other, "c\n3\n").unwrap();
+        studio.problems = vec!["from before the drag".to_owned()];
+        for file in [&text, &other] {
+            studio.dropped(&mut ui, FileDrop::Hovering(file.to_path_buf()));
+        }
+        studio.dropped(&mut ui, FileDrop::Dropped(text));
+        studio.dropped(&mut ui, FileDrop::Dropped(other));
+        assert_eq!(studio.sources.len(), 2);
+        assert_eq!(studio.problems.len(), 1, "{:?}", studio.problems);
+        assert!(studio.problems[0].contains("notes.txt not opened"));
+        let _ = std::fs::remove_dir_all(&folder);
+    }
 
     #[test]
     fn what_is_opened_is_told_by_its_scheme() {

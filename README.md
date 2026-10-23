@@ -34,8 +34,8 @@ Or from a clone: `cargo run --release -- trips.parquet`.
 
 ## What it does
 
-- **Opens files as they load.** CSV and Parquet files, from the command line or typed into
-  the box at the top, open in tabs of their own; rows appear while the rest is read. Click a
+- **Opens files as they load.** CSV and Parquet files, from the command line, typed into
+  the box at the top or dropped on the window, open in tabs of their own; rows appear while the rest is read. Click a
   column title to sort, drag column edges to resize, select rows with the mouse or keyboard
   and copy them as tab-separated text (Ctrl+C) for a spreadsheet.
 - **SQL over everything open.** Each file is a table named after it, in lower case with
@@ -107,8 +107,8 @@ sources change, `--light` for the light theme, `--seconds N` closes after N seco
 
 ## Next
 
-Opening files by dropping them on the window; a listed table's columns before opening it;
-bar charts of text categories and picking the charted columns without SQL.
+A listed table's columns before opening it; bar charts of text categories and picking the
+charted columns without SQL.
 
 ## License
 

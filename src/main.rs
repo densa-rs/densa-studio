@@ -39,6 +39,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         sources.push(requests.display().to_string());
         let readings = samples::readings_server()?;
         sources.push(format!("{readings}#key=sensor"));
+        // The same readings, every one of the last minute.
+        sources.push(format!("{readings}#time=time&window=1m&name=recent"));
     }
     let studio = studio::Studio::new(studio::Start {
         sources,

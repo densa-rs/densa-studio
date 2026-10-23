@@ -22,7 +22,8 @@ You need Rust 1.94 or later and a GPU with Vulkan, Metal, DirectX 12 or OpenGL.
 cargo install --locked --git https://github.com/densa-rs/densa-studio
 densa-studio trips.parquet zones.csv
 densa-studio --sample        # a million sample web requests (written to your cache
-                             # folder the first time) and a local stream of 500 sensors
+                             # folder the first time) and a local stream of 500 sensors:
+                             # `readings` (each sensor's latest) and `recent` (the last minute)
 densa-studio "wss://example.com/trades#key=id"
 densa-studio "grpc+tls://flight.example.com:443#sql=SELECT * FROM trips&header=authorization:Bearer $TOKEN"
 ```
@@ -56,8 +57,8 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   off); after the URL, options go after `#`, where the server never sees them:
   `#key=COLUMN` keeps the latest row of each key (without one, every row is kept, numbered
   in a `row` column, the newest million), `#subscribe=TEXT` sends a message each time the
-  connection opens (percent-encoded: `%7B` for `{`, `%23` for `#`), and `#arrow` reads Arrow
-  IPC instead of JSON, joined with `&`. The status bar shows each stream's connection, rows
+  connection opens (percent-encoded: `%7B` for `{`, `%23` for `#`), `#arrow` reads Arrow
+  IPC instead of JSON, and `#name=TABLE` names its table for SQL, joined with `&`. The status bar shows each stream's connection, rows
   per second and messages skipped; a lost connection is opened again.
 - **Time windows.** Streams and Flight sources take `time=COLUMN&window=10m` after `#`: only
   the rows whose time is within ten minutes of the newest are kept, older ones leaving as

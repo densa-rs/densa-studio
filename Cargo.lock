@@ -238,7 +238,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
  "x11rb",
 ]
 
@@ -2104,7 +2104,7 @@ dependencies = [
 [[package]]
 name = "densa-datafusion"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa-connectors#ace59ba4271039c9847722ec634350190f8d0228"
+source = "git+https://github.com/densa-rs/densa-connectors#e36021fd8b55d86e790ea09147a4eb94c781f945"
 dependencies = [
  "arrow-array 60.0.0",
  "arrow-ipc 60.0.0",
@@ -2127,7 +2127,7 @@ dependencies = [
 [[package]]
 name = "densa-files"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa-connectors#ace59ba4271039c9847722ec634350190f8d0228"
+source = "git+https://github.com/densa-rs/densa-connectors#e36021fd8b55d86e790ea09147a4eb94c781f945"
 dependencies = [
  "arrow-array 60.0.0",
  "arrow-csv 60.0.0",
@@ -2138,7 +2138,7 @@ dependencies = [
 [[package]]
 name = "densa-flight"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa-connectors#ace59ba4271039c9847722ec634350190f8d0228"
+source = "git+https://github.com/densa-rs/densa-connectors#e36021fd8b55d86e790ea09147a4eb94c781f945"
 dependencies = [
  "arrow-array 60.0.0",
  "arrow-flight",
@@ -2272,7 +2272,7 @@ dependencies = [
 [[package]]
 name = "densa-ws"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa-connectors#ace59ba4271039c9847722ec634350190f8d0228"
+source = "git+https://github.com/densa-rs/densa-connectors#e36021fd8b55d86e790ea09147a4eb94c781f945"
 dependencies = [
  "arrow-array 60.0.0",
  "arrow-buffer 60.0.0",
@@ -2401,7 +2401,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4619,7 +4619,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4681,7 +4681,7 @@ dependencies = [
 [[package]]
 name = "samples"
 version = "0.1.0"
-source = "git+https://github.com/densa-rs/densa-connectors#ace59ba4271039c9847722ec634350190f8d0228"
+source = "git+https://github.com/densa-rs/densa-connectors#e36021fd8b55d86e790ea09147a4eb94c781f945"
 dependencies = [
  "arrow-array 60.0.0",
  "arrow-flight",
@@ -5027,7 +5027,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5840,7 +5840,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -45,6 +45,8 @@ pub(crate) struct StreamSpec {
     pub(crate) headers: Vec<(String, String)>,
     /// The rows kept by their time, if a window is given.
     pub(crate) window: Option<TimeWindow>,
+    /// The table name asked for.
+    pub(crate) name: Option<String>,
 }
 
 impl std::fmt::Debug for StreamSpec {
@@ -57,6 +59,7 @@ impl std::fmt::Debug for StreamSpec {
             .field("subscribe", &self.subscribe.len())
             .field("headers", &headers)
             .field("window", &self.window)
+            .field("name", &self.name)
             .finish()
     }
 }
@@ -69,8 +72,8 @@ impl StreamSpec {
     }
 
     /// Reads a stream's URL: `key=COLUMN`, `subscribe=TEXT` (any number of times), `arrow`,
-    /// `header=NAME:VALUE` (any number of times) and a window (`time=COLUMN&window=10m`,
-    /// `unit=s`), percent-encoded and separated by `&` after `#`.
+    /// `header=NAME:VALUE` (any number of times), `name=TABLE` and a window
+    /// (`time=COLUMN&window=10m`, `unit=s`), percent-encoded and separated by `&` after `#`.
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let (url, options) = options(text)?;
         let mut spec = Self {
@@ -80,6 +83,7 @@ impl StreamSpec {
             subscribe: Vec::new(),
             headers: Vec::new(),
             window: None,
+            name: None,
         };
         let mut window = WindowOptions::default();
         for (name, value) in options {
@@ -89,16 +93,18 @@ impl StreamSpec {
             match (name.as_str(), value.is_empty()) {
                 ("key", false) if spec.key.is_some() => return Err("key= is given twice".into()),
                 ("key", false) => spec.key = Some(value),
+                ("name", false) if spec.name.is_some() => return Err("name= is given twice".into()),
+                ("name", false) => spec.name = Some(value),
                 ("subscribe", false) => spec.subscribe.push(value),
                 ("header", false) => spec.headers.push(header(&value)?),
                 ("arrow", true) => spec.arrow = true,
-                ("key" | "subscribe" | "header", true) => {
+                ("key" | "subscribe" | "header" | "name", true) => {
                     return Err(format!("{name} needs a value"))
                 }
                 _ => {
                     return Err(format!(
                         "unknown stream option {}: Studio knows key=COLUMN, subscribe=TEXT \
-                         (with & written %26), arrow, header=NAME:VALUE and {}",
+                         (with & written %26), arrow, header=NAME:VALUE, name=TABLE and {}",
                         option_text(&name, &value),
                         WindowOptions::KNOWN
                     ))
@@ -139,6 +145,9 @@ impl StreamSpec {
         if let Some(window) = &self.window {
             options.extend(window.options());
         }
+        if let Some(name) = &self.name {
+            options.push(format!("name={}", encode(name)));
+        }
         if !options.is_empty() {
             origin.push('#');
             origin.push_str(&options.join("&"));
@@ -146,8 +155,12 @@ impl StreamSpec {
         origin
     }
 
-    /// What its table is named after: the last part of the path, or the host.
+    /// What its table is named after: the name asked for, the last part of the path, or the
+    /// host.
     pub(crate) fn name_hint(&self) -> String {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
         let title = self.title();
         let mut parts = title.split('/').filter(|p| !p.is_empty());
         let host = parts.next().unwrap_or("stream").to_owned();

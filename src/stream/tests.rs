@@ -151,6 +151,24 @@ fn option_values_are_written_back_as_they_read() {
 }
 
 #[test]
+fn a_stream_can_name_its_table() {
+    let spec = StreamSpec::parse("ws://h/readings#name=recent&key=id").unwrap();
+    assert_eq!(spec.name_hint(), "recent");
+    assert_eq!(spec.origin(), "ws://h/readings#key=id&name=recent");
+    assert!(format!("{spec:?}").contains("name: Some(\"recent\")"));
+    let twice = StreamSpec::parse("ws://h/p#name=a&name=b").unwrap_err();
+    assert_eq!(twice, "name= is given twice");
+    assert_eq!(
+        StreamSpec::parse("ws://h/p#name").unwrap_err(),
+        "name needs a value"
+    );
+    assert_eq!(
+        StreamSpec::parse("ws://h/readings").unwrap().name_hint(),
+        "readings"
+    );
+}
+
+#[test]
 fn a_window_is_part_of_what_a_stream_is_known_by() {
     let spec = StreamSpec::parse("ws://h/p#key=id&time=at&window=10m&unit=s").unwrap();
     let window = spec.window.as_ref().unwrap();
@@ -161,7 +179,7 @@ fn a_window_is_part_of_what_a_stream_is_known_by() {
     assert!(error.contains("time=COLUMN"), "{error}");
     let error = StreamSpec::parse("ws://h/p#later").unwrap_err();
     assert!(
-        error.ends_with("and time=COLUMN, window=10m and unit=s"),
+        error.ends_with("name=TABLE and time=COLUMN, window=10m and unit=s"),
         "{error}"
     );
 }

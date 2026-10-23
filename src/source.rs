@@ -780,7 +780,9 @@ mod tests {
             )])
             .unwrap();
             let empty = RecordBatch::new_empty(unkeyable.schema());
-            source.upsert(&mut ui, rows[0].clone(), None);
+            for batch in rows {
+                source.upsert(&mut ui, batch, None);
+            }
             assert_eq!(source.rows(&ui), 3, "rows of a try");
             source.start_table(&mut ui, &empty);
             assert_eq!(source.rows(&ui), 0, "gone, though no table could be made");

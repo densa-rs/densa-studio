@@ -18,8 +18,8 @@ arrow-array = "60"
 arrow-cast = "60"
 arrow-schema = "60"
 parquet = { version = "60", default-features = false, features = ["arrow"] }
-# densa from crates.io; its connectors from their main branch until they are released
-# (Cargo.lock pins the commit).
+# densa from crates.io (patched below); its connectors from their main branch until they are
+# released (Cargo.lock pins the commit).
 densa-arrow = "0.2"
 densa-chart = "0.2"
 densa-data = "0.2"
@@ -46,3 +46,16 @@ unsafe_code = "forbid"
 
 [profile.release]
 debug = 1
+
+# Time windows (`densa_data::Window`) are newer than densa 0.2.0: until the next release, densa
+# comes from its main branch (Cargo.lock pins the commit).
+[patch.crates-io]
+densa-arrow = { git = "https://github.com/densa-rs/densa" }
+densa-chart = { git = "https://github.com/densa-rs/densa" }
+densa-data = { git = "https://github.com/densa-rs/densa" }
+densa-draw = { git = "https://github.com/densa-rs/densa" }
+densa-paragraph = { git = "https://github.com/densa-rs/densa" }
+densa-text = { git = "https://github.com/densa-rs/densa" }
+densa-ui = { git = "https://github.com/densa-rs/densa" }
+densa-widgets = { git = "https://github.com/densa-rs/densa" }
+densa-window = { git = "https://github.com/densa-rs/densa" }

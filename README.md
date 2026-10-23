@@ -59,6 +59,14 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   connection opens (percent-encoded: `%7B` for `{`, `%23` for `#`), and `#arrow` reads Arrow
   IPC instead of JSON, joined with `&`. The status bar shows each stream's connection, rows
   per second and messages skipped; a lost connection is opened again.
+- **Time windows.** Streams and Flight sources take `time=COLUMN&window=10m` after `#`: only
+  the rows whose time is within ten minutes of the newest are kept, older ones leaving as
+  new ones come (`500ms`, `30s`, `10m`, `2h` and `1d` are spans too). The window follows
+  the data's own times, not the clock. A column of timestamps or dates is read in its own
+  unit; a column of numbers is read as milliseconds since some start, as JSON feeds mostly
+  send them, unless `unit=s` (or `ms`, `us`, `ns`) says otherwise. The status bar names the
+  window, `(last 10m by time)`, or says why it is off when the rows have no such column of
+  times or numbers (the rows are kept all the same).
 - **Arrow Flight.** A `grpc://` or `grpc+tls://` URL opens a Flight service's data in a tab
   that fills as it arrives. After `#`, say what to ask for: `sql=QUERY` (a Flight SQL
   server), `path=A/B` (a dataset by its path) or `ticket=T`; `key=COLUMN` keeps the latest
@@ -85,9 +93,9 @@ sources change, `--light` for the light theme, `--seconds N` closes after N seco
 
 ## Next
 
-Browsing what a Flight SQL server has; keeping a stream's last minutes rather than its newest
-rows; saving query results; opening files by dropping them on the window; bar
-charts of text categories and picking the charted columns without SQL.
+Browsing what a Flight SQL server has; showing number columns of times as times; saving
+query results; opening files by dropping them on the window; bar charts of text categories
+and picking the charted columns without SQL.
 
 ## License
 

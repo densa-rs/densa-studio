@@ -1,6 +1,7 @@
 //! Arrow Flight sources: a Flight service's data, opened from a `grpc://` or `grpc+tls://`
 //! URL whose part after `#` says what to ask for and how to keep it:
-//! `grpc://host:port#sql=SELECT ...&key=id&header=authorization:$TOKEN&name=trips`.
+//! `grpc://host:port#sql=SELECT ...&key=id&header=authorization:$TOKEN&name=trips`, with a
+//! time window `time=COLUMN&window=10m` if wanted.
 
 use std::fmt;
 use std::time::Duration;
@@ -11,6 +12,7 @@ use densa_flight::{FlightEvent, FlightOptions, FlightStream};
 use crate::stream::{
     encode, header, header_value, option_text, options, parts, shortened, Arrived, Keying,
 };
+use crate::window::{TimeWindow, WindowOptions};
 
 /// A failed read that may pass is tried again after this, then twice as long, up to
 /// [`RETRY_MOST`].
@@ -44,6 +46,8 @@ pub(crate) struct FlightSpec {
     pub(crate) headers: Vec<(String, String)>,
     /// The table name asked for.
     pub(crate) name: Option<String>,
+    /// The rows kept by their time, if a window is given.
+    pub(crate) window: Option<TimeWindow>,
 }
 
 impl fmt::Debug for FlightSpec {
@@ -55,6 +59,7 @@ impl fmt::Debug for FlightSpec {
             .field("key", &self.key)
             .field("headers", &headers)
             .field("name", &self.name)
+            .field("window", &self.window)
             .finish()
     }
 }
@@ -77,8 +82,8 @@ impl FlightSpec {
     }
 
     /// Reads a Flight URL: one of `sql=QUERY`, `path=a/b` or `ticket=T`, then `key=COLUMN`,
-    /// `header=NAME:VALUE` (any number of times) and `name=TABLE`, percent-encoded and
-    /// separated by `&` after `#`.
+    /// `header=NAME:VALUE` (any number of times), `name=TABLE` and a window
+    /// (`time=COLUMN&window=10m`, `unit=s`), percent-encoded and separated by `&` after `#`.
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let (url, options) = options(text)?;
         let mut spec = Self {
@@ -88,9 +93,14 @@ impl FlightSpec {
             key: None,
             headers: Vec::new(),
             name: None,
+            window: None,
         };
         let mut asked = None;
+        let mut window = WindowOptions::default();
         for (option, value) in options {
+            if window.take(&option, &value)? {
+                continue;
+            }
             if value.is_empty() {
                 return Err(format!("{option} needs a value"));
             }
@@ -105,6 +115,7 @@ impl FlightSpec {
         if matches!(&spec.request, Request::Path(parts) if parts.is_empty()) {
             return Err("path= names a dataset: path=A/B".to_owned());
         }
+        spec.window = window.finish()?;
         Ok(spec)
     }
 
@@ -129,8 +140,9 @@ impl FlightSpec {
             _ => {
                 return Err(format!(
                     "unknown Flight option {}: Studio knows sql=QUERY, path=A/B, ticket=T, \
-                     key=COLUMN, header=NAME:VALUE and name=TABLE",
-                    option_text(option, &value)
+                     key=COLUMN, header=NAME:VALUE, name=TABLE and {}",
+                    option_text(option, &value),
+                    WindowOptions::KNOWN
                 ))
             }
         };
@@ -165,8 +177,8 @@ impl FlightSpec {
     }
 
     /// What the source is known by, to find it open again and in a saved arrangement: its
-    /// scheme and host in lower case, what is asked (a ticket only by a hash of it), its key
-    /// and its name, written as options are; not headers, which may hold secrets.
+    /// scheme and host in lower case, what is asked (a ticket only by a hash of it), its key,
+    /// name and window, written as options are; not headers, which may hold secrets.
     pub(crate) fn origin(&self) -> String {
         let (scheme, host, _) = parts(&self.url);
         let asked = match &self.request {
@@ -184,6 +196,10 @@ impl FlightSpec {
         }
         if let Some(name) = &self.name {
             origin.push_str(&format!("&name={}", encode(name)));
+        }
+        for option in self.window.iter().flat_map(TimeWindow::options) {
+            origin.push('&');
+            origin.push_str(&option);
         }
         origin
     }
@@ -358,6 +374,23 @@ mod tests {
         assert!(!ticket.origin().contains("secret"), "{}", ticket.origin());
         let other = FlightSpec::parse("grpc://h:1#ticket=other").unwrap();
         assert_ne!(ticket.origin(), other.origin());
+    }
+
+    #[test]
+    fn a_window_is_part_of_what_a_flight_source_is_known_by() {
+        let spec = FlightSpec::parse("grpc://h#path=a&time=t&window=1h").unwrap();
+        assert_eq!(spec.window.as_ref().unwrap().span.as_secs(), 3_600);
+        assert_eq!(spec.origin(), "grpc://h#path=a&time=t&window=1h");
+        assert!(format!("{spec:?}").contains("window: Some"));
+        let error = FlightSpec::parse("grpc://h#path=a&time=t").unwrap_err();
+        assert!(error.contains("window=10m"), "{error}");
+        let error = FlightSpec::parse("grpc://h#path=a&time=").unwrap_err();
+        assert_eq!(error, "time needs a value");
+        let error = FlightSpec::parse("grpc://h#path=a&later=1").unwrap_err();
+        assert!(
+            error.ends_with("and time=COLUMN, window=10m and unit=s"),
+            "{error}"
+        );
     }
 
     #[test]

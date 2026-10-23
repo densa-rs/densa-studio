@@ -16,6 +16,7 @@ mod sample;
 mod source;
 mod stream;
 mod studio;
+mod window;
 
 use std::error::Error;
 use std::time::{Duration, Instant};

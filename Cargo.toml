@@ -18,15 +18,15 @@ arrow-array = "60"
 arrow-cast = "60"
 arrow-schema = "60"
 parquet = { version = "60", default-features = false, features = ["arrow"] }
-# densa and its connectors from their main branches until their next releases (Cargo.lock
-# pins the commits).
-densa-arrow = { git = "https://github.com/densa-rs/densa" }
-densa-chart = { git = "https://github.com/densa-rs/densa" }
-densa-data = { git = "https://github.com/densa-rs/densa" }
-densa-draw = { git = "https://github.com/densa-rs/densa" }
-densa-ui = { git = "https://github.com/densa-rs/densa" }
-densa-widgets = { git = "https://github.com/densa-rs/densa" }
-densa-window = { git = "https://github.com/densa-rs/densa" }
+# densa from crates.io; its connectors from their main branch until they are released
+# (Cargo.lock pins the commit).
+densa-arrow = "0.2"
+densa-chart = "0.2"
+densa-data = "0.2"
+densa-draw = "0.2"
+densa-ui = "0.2"
+densa-widgets = "0.2"
+densa-window = "0.2"
 densa-datafusion = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-files = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-flight = { git = "https://github.com/densa-rs/densa-connectors" }
@@ -36,8 +36,8 @@ samples = { git = "https://github.com/densa-rs/densa-connectors" }
 
 [dev-dependencies]
 # Text without the system's fonts, for tests of the panels.
-densa-paragraph = { git = "https://github.com/densa-rs/densa", default-features = false }
-densa-text = { git = "https://github.com/densa-rs/densa" }
+densa-paragraph = { version = "0.2", default-features = false }
+densa-text = "0.2"
 # A Flight service to read in tests.
 samples = { git = "https://github.com/densa-rs/densa-connectors", features = ["flight"] }
 

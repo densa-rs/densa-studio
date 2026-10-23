@@ -10,9 +10,9 @@ of live data, and on its [connectors](https://github.com/densa-rs/densa-connecto
   <img alt="densa studio: a live stream of 500 sensors in a grid; below it a live SQL query counting the sensors at each temperature, its result, and a chart of it, all updating each second" src="https://raw.githubusercontent.com/densa-rs/densa-studio/main/docs/studio.png" width="760">
 </p>
 
-> **Status: 0.1, experimental.** Studio is installed from this repository; it uses densa and
-> its connectors from their main branches (pinned in `Cargo.lock`) until their next
-> releases.
+> **Status: 0.1, experimental.** Studio is installed from this repository. It uses densa 0.2
+> from crates.io, and densa's connectors from their main branch (pinned in `Cargo.lock`)
+> until they are released.
 
 ## Install and run
 

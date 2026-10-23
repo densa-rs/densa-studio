@@ -767,7 +767,8 @@ mod tests {
             assert!(!source.blocks_query(), "done: nothing to wait for");
             source.skipped = 7;
             source.refused = Some("old".to_owned());
-            let columns = RecordBatch::new_empty(source.snapshot(&ui).unwrap().0);
+            let (schema, rows) = source.snapshot(&ui).unwrap();
+            let columns = RecordBatch::new_empty(schema);
             source.start_table(&mut ui, &columns);
             assert_eq!(source.rows(&ui), 0, "the last try's rows went");
             assert!(source.refused.is_none() && source.skipped == 0);
@@ -779,9 +780,10 @@ mod tests {
             )])
             .unwrap();
             let empty = RecordBatch::new_empty(unkeyable.schema());
-            source.upsert(&mut ui, columns.clone(), None);
+            source.upsert(&mut ui, rows[0].clone(), None);
+            assert_eq!(source.rows(&ui), 3, "rows of a try");
             source.start_table(&mut ui, &empty);
-            assert_eq!(source.rows(&ui), 0);
+            assert_eq!(source.rows(&ui), 0, "gone, though no table could be made");
             assert!(source.snapshot(&ui).is_err(), "no table for SQL");
             assert!(
                 source.status(&ui).contains(", refused: "),

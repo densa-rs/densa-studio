@@ -23,13 +23,13 @@ arrow-schema = "60"
 parquet = { version = "60", default-features = false, features = ["arrow"] }
 # densa from crates.io; its connectors from their main branch until they are released
 # (Cargo.lock pins the commit).
-densa-arrow = "0.2.1"
-densa-chart = "0.2.1"
-densa-data = "0.2.1"
-densa-draw = "0.2.1"
-densa-ui = "0.2.1"
-densa-widgets = "0.2.1"
-densa-window = "0.2.1"
+densa-arrow = "0.2.2"
+densa-chart = "0.2.2"
+densa-data = "0.2.2"
+densa-draw = "0.2.2"
+densa-ui = "0.2.2"
+densa-widgets = "0.2.2"
+densa-window = "0.2.2"
 densa-datafusion = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-files = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-flight = { git = "https://github.com/densa-rs/densa-connectors" }
@@ -39,27 +39,13 @@ samples = { git = "https://github.com/densa-rs/densa-connectors", features = ["f
 
 [dev-dependencies]
 # Text without the system's fonts, for tests of the panels.
-densa-paragraph = { version = "0.2.1", default-features = false }
-densa-text = "0.2.1"
+densa-paragraph = { version = "0.2.2", default-features = false }
+densa-text = "0.2.2"
 # The grid's model, prepared as a paint does, for tests that choose rows.
-densa-grid = "0.2.1"
+densa-grid = "0.2.2"
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [profile.release]
 debug = 1
-
-# Files dropped on the window (densa_window::FileDrop) and category axes are newer than densa
-# 0.2.1: until the next release, densa comes from its main branch (Cargo.lock pins the commit).
-[patch.crates-io]
-densa-arrow = { git = "https://github.com/densa-rs/densa" }
-densa-chart = { git = "https://github.com/densa-rs/densa" }
-densa-data = { git = "https://github.com/densa-rs/densa" }
-densa-draw = { git = "https://github.com/densa-rs/densa" }
-densa-grid = { git = "https://github.com/densa-rs/densa" }
-densa-paragraph = { git = "https://github.com/densa-rs/densa" }
-densa-text = { git = "https://github.com/densa-rs/densa" }
-densa-ui = { git = "https://github.com/densa-rs/densa" }
-densa-widgets = { git = "https://github.com/densa-rs/densa" }
-densa-window = { git = "https://github.com/densa-rs/densa" }

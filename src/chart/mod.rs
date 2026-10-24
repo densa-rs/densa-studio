@@ -371,7 +371,7 @@ fn caption(x: &str, kind: AxisKind, panes: &[(usize, String)]) -> String {
 
 /// The values of `array` as numbers (NaN for a null): numbers as they are, timestamps as
 /// seconds since the epoch, dates as the seconds of their midnight.
-fn numbers(array: &dyn Array) -> Result<Vec<f64>, String> {
+pub(crate) fn numbers(array: &dyn Array) -> Result<Vec<f64>, String> {
     let counted = |per_second: f64, days: bool| -> Result<Vec<f64>, String> {
         let counts = cast(array, &DataType::Int64).map_err(|e| e.to_string())?;
         let counts = counts.as_primitive::<Int64Type>();

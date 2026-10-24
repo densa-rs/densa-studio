@@ -2,7 +2,7 @@
 //! Studio turns it into UTC timestamps as rows arrive (numbers count milliseconds unless
 //! `unit=s`, `us` or `ns` says otherwise, as JSON feeds mostly send them; text is read as
 //! ISO 8601, or as such a number). `window=10m` then keeps only the rows within ten minutes of
-//! the newest.
+//! the newest, and `per=1m` counts the rows of each minute (see [`crate::counts`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,6 +70,8 @@ pub(crate) struct TimeSpec {
     unit: Option<Unit>,
     /// How far back from the newest time rows are kept; every row without one.
     pub(crate) window: Option<Duration>,
+    /// How long the buckets the rows are counted in are, if they are counted.
+    pub(crate) per: Option<Duration>,
 }
 
 /// The time options of a source's URL, as they are read.
@@ -77,12 +79,13 @@ pub(crate) struct TimeSpec {
 pub(crate) struct TimeOptions {
     column: Option<String>,
     span: Option<Duration>,
+    per: Option<Duration>,
     unit: Option<Unit>,
 }
 
 impl TimeOptions {
     /// The options Studio knows here, for messages about unknown ones.
-    pub(crate) const KNOWN: &'static str = "time=COLUMN, unit=s and window=10m";
+    pub(crate) const KNOWN: &'static str = "time=COLUMN, unit=s, window=10m and per=1m";
 
     /// Takes in `name=value` if it is a time option; whether it was.
     pub(crate) fn take(&mut self, name: &str, value: &str) -> Result<bool, String> {
@@ -92,7 +95,9 @@ impl TimeOptions {
             "time" if self.column.is_some() => return Err(twice()),
             "time" => self.column = Some(value.to_owned()),
             "window" if self.span.is_some() => return Err(twice()),
-            "window" => self.span = Some(span(value)?),
+            "window" => self.span = Some(span(name, value)?),
+            "per" if self.per.is_some() => return Err(twice()),
+            "per" => self.per = Some(span(name, value)?),
             "unit" if self.unit.is_some() => return Err(twice()),
             "unit" => {
                 self.unit = Some(Unit::parse(value).ok_or("unit= is s, ms, us or ns")?);
@@ -109,16 +114,20 @@ impl TimeOptions {
             return Err("time= and key= name the same column: a key cannot be a time".into());
         }
         let Some(column) = self.column else {
-            return match (self.span, self.unit) {
-                (Some(_), _) => Err("window= needs the column of times: time=COLUMN".into()),
-                (None, Some(_)) => Err("unit= goes with the column of times: time=COLUMN".into()),
-                (None, None) => Ok(None),
+            return match (self.span, self.per, self.unit) {
+                (Some(_), _, _) => Err("window= needs the column of times: time=COLUMN".into()),
+                (None, Some(_), _) => Err("per= needs the column of times: time=COLUMN".into()),
+                (None, None, Some(_)) => {
+                    Err("unit= goes with the column of times: time=COLUMN".into())
+                }
+                (None, None, None) => Ok(None),
             };
         };
         Ok(Some(TimeSpec {
             column,
             unit: self.unit,
             window: self.span,
+            per: self.per,
         }))
     }
 }
@@ -129,6 +138,9 @@ impl TimeSpec {
         let mut options = vec![format!("time={}", crate::stream::encode(&self.column))];
         if let Some(span) = self.window {
             options.push(format!("window={}", written(span)));
+        }
+        if let Some(per) = self.per {
+            options.push(format!("per={}", written(per)));
         }
         if let Some(unit) = self.unit {
             options.push(format!("unit={}", unit.text()));
@@ -258,9 +270,10 @@ fn to_times(column: &ArrayRef, to: &DataType, unit: Unit) -> Result<ArrayRef, St
     cast(column, to).map_err(error)
 }
 
-/// A span written as a number and a unit: `500ms`, `30s`, `10m`, `1.5h`, `7d`.
-fn span(text: &str) -> Result<Duration, String> {
-    let wrong = || format!("window={text}: write a span such as 30s, 10m, 2h or 1d");
+/// The span of option `name`, written as a number and a unit: `500ms`, `30s`, `10m`, `1.5h`,
+/// `7d`.
+fn span(name: &str, text: &str) -> Result<Duration, String> {
+    let wrong = || format!("{name}={text}: write a span such as 30s, 10m, 2h or 1d");
     let digits = text
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .ok_or_else(wrong)?;
@@ -275,10 +288,12 @@ fn span(text: &str) -> Result<Duration, String> {
         _ => return Err(wrong()),
     };
     if seconds > MOST.as_secs_f64() {
-        return Err(format!("window={text} is longer than a year"));
+        return Err(format!("{name}={text} is longer than a year"));
     }
     match Duration::try_from_secs_f64(seconds) {
-        Ok(span) if span.is_zero() => Err(format!("window={text} keeps nothing")),
+        Ok(span) if span.is_zero() => Err(format!(
+            "{name}={text} is no time at all: write a span such as 30s, 10m, 2h or 1d"
+        )),
         Ok(span) => Ok(span),
         Err(_) => Err(wrong()),
     }
@@ -286,7 +301,7 @@ fn span(text: &str) -> Result<Duration, String> {
 
 /// `span` written in the largest unit that holds it whole (`90m`, not `1.5h`), so one span
 /// is always written one way.
-fn written(span: Duration) -> String {
+pub(crate) fn written(span: Duration) -> String {
     const UNITS: [(&str, u128); 5] = [
         ("d", 86_400_000_000_000),
         ("h", 3_600_000_000_000),

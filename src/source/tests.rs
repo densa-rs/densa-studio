@@ -169,6 +169,131 @@ mod streams {
         .unwrap()
     }
 
+    /// Numbered rows at `millis` since the epoch, as UTC timestamps in a column `at`.
+    fn timed_rows(first: u64, millis: &[i64]) -> RecordBatch {
+        let count = millis.len() as u64;
+        let at =
+            arrow_array::TimestampMillisecondArray::from(millis.to_vec()).with_timezone("+00:00");
+        RecordBatch::try_from_iter([
+            ("at", Arc::new(at) as _),
+            (
+                "row",
+                Arc::new(arrow_array::UInt64Array::from_iter_values(
+                    first..first + count,
+                )) as _,
+            ),
+        ])
+        .unwrap()
+    }
+
+    /// The middles and rows of the bars counting `source`'s rows, once charted.
+    fn counted(ui: &mut Ui, source: &mut Source) -> (Vec<f64>, Vec<f64>) {
+        // Nothing comes from the quiet stream, so this charts what was put in by hand.
+        source.take(ui, Instant::now() + Duration::from_millis(1));
+        let chart = source.counts.as_ref().unwrap().chart();
+        let chart = ui.widget::<crate::counts::CountChart>(chart).unwrap();
+        let (middles, rows) = chart.model().bars();
+        (middles.to_vec(), rows.to_vec())
+    }
+
+    #[test]
+    fn rows_are_counted_per_bucket_of_their_time() {
+        let (mut ui, mut source) = quiet("#time=at&per=1s");
+        assert_eq!(counted(&mut ui, &mut source), (vec![], vec![]));
+        source.upsert(&mut ui, timed_rows(0, &[100, 500, 1_200, 3_900]), None);
+        assert_eq!(
+            counted(&mut ui, &mut source),
+            (vec![0.5, 1.5, 3.5], vec![2.0, 1.0, 1.0]),
+            "a bar at the middle of each second that has rows"
+        );
+        source.upsert(&mut ui, timed_rows(4, &[1_999]), None);
+        assert_eq!(counted(&mut ui, &mut source).1, [2.0, 2.0, 1.0]);
+        let status = source.status(&ui);
+        assert!(!status.contains("counts off"), "{status}");
+    }
+
+    #[test]
+    fn counts_leave_with_the_rows_a_window_lets_go() {
+        let (mut ui, mut source) = quiet("#time=at&window=3s&per=1s");
+        source.upsert(&mut ui, timed_rows(0, &[100, 1_200, 2_500]), None);
+        assert_eq!(counted(&mut ui, &mut source).0, [0.5, 1.5, 2.5]);
+        source.upsert(&mut ui, timed_rows(3, &[3_900]), None);
+        assert_eq!(
+            counted(&mut ui, &mut source),
+            (vec![1.5, 2.5, 3.5], vec![1.0, 1.0, 1.0]),
+            "rows more than 3 s older than the newest went, and their seconds with them"
+        );
+    }
+
+    #[test]
+    fn a_time_column_that_is_not_times_is_not_counted_and_says_why() {
+        let (mut ui, mut source) = quiet("#time=name&per=1m");
+        source.upsert(&mut ui, numbered(0, &["a"]), None);
+        let off = source.counts.as_ref().unwrap().off.clone();
+        assert_eq!(off.as_deref(), Some("counts need times; name holds Utf8"));
+        let status = source.status(&ui);
+        assert!(
+            status.contains("counts off: counts need times; name holds Utf8"),
+            "{status}"
+        );
+        assert_eq!(counted(&mut ui, &mut source), (vec![], vec![]));
+        assert_eq!(source.rows(&ui), 1, "the rows come all the same");
+    }
+
+    #[test]
+    fn buckets_finer_than_the_times_unit_are_refused_with_the_fix() {
+        let (mut ui, mut source) = quiet("#time=at&unit=s&per=1500ms");
+        let seconds = arrow_array::TimestampSecondArray::from(vec![5]).with_timezone("+00:00");
+        let batch = RecordBatch::try_from_iter([
+            ("at", Arc::new(seconds) as _),
+            (
+                "row",
+                Arc::new(arrow_array::UInt64Array::from(vec![0])) as _,
+            ),
+        ])
+        .unwrap();
+        source.upsert(&mut ui, batch, None);
+        let off = source.counts.as_ref().unwrap().off.clone().unwrap();
+        assert_eq!(
+            off,
+            "per=1500ms is not a whole number of seconds, which at counts: write per=1s or a multiple of it"
+        );
+    }
+
+    #[test]
+    fn a_table_without_the_time_column_is_not_counted() {
+        let (mut ui, mut source) = quiet("#time=at&per=1s");
+        source.upsert(&mut ui, numbered(0, &["a"]), None);
+        let off = source.counts.as_ref().unwrap().off.clone();
+        assert_eq!(
+            off.as_deref(),
+            Some("the time column at is not in the rows")
+        );
+    }
+
+    #[test]
+    fn counts_left_to_chart_ask_for_another_frame() {
+        let (mut ui, mut source) = quiet("#time=at&per=1ms");
+        let millis: Vec<i64> = (0..5_000).collect();
+        source.upsert(&mut ui, timed_rows(0, &millis), None);
+        let soon = || Instant::now() + Duration::from_secs(1);
+        assert!(
+            !source.take(&mut ui, soon()),
+            "charted at once: nothing left"
+        );
+        source.upsert(&mut ui, timed_rows(5_000, &[9_999]), None);
+        assert!(
+            source.take(&mut ui, soon()),
+            "many buckets read a moment ago are charted at a later frame"
+        );
+    }
+
+    #[test]
+    fn only_a_source_that_says_per_is_counted() {
+        let (_ui, source) = quiet("#time=at&window=1m");
+        assert!(source.counts.is_none());
+    }
+
     #[test]
     fn rows_too_old_go_even_when_the_rows_after_them_are_refused() {
         let (mut ui, mut source) = quiet("");
@@ -432,6 +557,39 @@ mod flights {
             source.status(&ui).contains(", refused: "),
             "{}",
             source.status(&ui)
+        );
+    }
+
+    #[test]
+    fn counts_start_over_with_their_table_even_when_none_can_be_made() {
+        let url = samples::flight_server_of(3).unwrap();
+        let (mut ui, mut source) = read(&format!("{url}#path=requests&time=time&per=1s"));
+        assert_eq!(source.rows(&ui), 3);
+        source.take(&mut ui, Instant::now() + Duration::from_millis(1));
+        let counts = source.counts.as_ref().unwrap();
+        let chart = ui
+            .widget::<crate::counts::CountChart>(counts.chart())
+            .unwrap();
+        let rows: f64 = chart.model().bars().1.iter().sum();
+        assert_eq!(rows, 3.0, "{}", counts.said());
+        let unkeyable = RecordBatch::try_from_iter([(
+            "row",
+            Arc::new(arrow_array::BooleanArray::from(vec![true])) as _,
+        )])
+        .unwrap();
+        source.start_table(&mut ui, &RecordBatch::new_empty(unkeyable.schema()));
+        let counts = source.counts.as_ref().unwrap();
+        let chart = ui
+            .widget::<crate::counts::CountChart>(counts.chart())
+            .unwrap();
+        assert!(
+            chart.model().bars().1.is_empty(),
+            "the last try's counts went"
+        );
+        assert!(
+            counts.said().ends_with("waiting for the first rows"),
+            "{}",
+            counts.said()
         );
     }
 

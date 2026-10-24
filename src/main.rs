@@ -10,6 +10,7 @@
 mod args;
 mod chart;
 mod config;
+mod counts;
 mod flight;
 mod listing;
 mod query;
@@ -41,9 +42,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         let flight = samples::flight_server()?;
         sources.push(format!("{flight}#tables"));
         let readings = samples::readings_server()?;
-        // Every reading of the last minute, then each sensor's latest (in front, as its
-        // values change in place).
-        sources.push(format!("{readings}#time=time&window=1m&name=recent"));
+        // Every reading of the last minute, counted per second, then each sensor's latest
+        // (in front, as its values change in place).
+        sources.push(format!("{readings}#time=time&window=1m&per=1s&name=recent"));
         sources.push(format!("{readings}#key=sensor&time=time"));
     }
     let studio = studio::Studio::new(studio::Start {

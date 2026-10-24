@@ -23,9 +23,9 @@ cargo install --locked --git https://github.com/densa-rs/densa-studio
 densa-studio trips.parquet zones.csv
 densa-studio --sample        # a million sample web requests (written to your cache
                              # folder the first time) and a local stream of 500 sensors:
-                             # `readings` (each sensor's latest) and `recent` (the last minute),
-                             # their `time` column as timestamps, and a local Flight SQL
-                             # service's list of tables
+                             # `readings` (each sensor's latest) and `recent` (the last minute,
+                             # counted per second), their `time` column as timestamps, and a
+                             # local Flight SQL service's list of tables
 densa-studio "wss://example.com/trades#key=id"
 densa-studio "grpc+tls://flight.example.com:443#sql=SELECT * FROM trips&header=authorization:Bearer $TOKEN"
 ```
@@ -76,6 +76,16 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   of the newest are kept, older ones leaving as new ones come (`500ms`, `30s`, `10m`, `2h`
   and `1d` are spans too). The window follows the data's own times, not the clock. The
   status bar names it: `(last 10m by time)`.
+- **Rows per minute, as they come.** With `per=1m` beside `time=COLUMN`, a tab below the
+  source (`recent per 1m`) charts how many of its rows fall in each minute of that column, a
+  bar per minute, following the newest. The source's live table keeps the counts as rows come
+  and go, so the chart costs a row per minute, not a read of every row, and with a window the
+  oldest minutes leave with their rows. `per=` takes the spans `window=` does, in whole units
+  of the column (whole seconds with `unit=s`); a column that does not hold times, or a span
+  that does not fit it, is named in the tab and the status bar, with the fix. A keyed source
+  counts each key once, in the minute of its latest row. Buckets run back to back from 1970
+  in UTC, so `per=1d` days start at midnight UTC and `per=7d` weeks on Thursdays; rows without
+  a time are left out, and the tab says how many.
 - **Arrow Flight.** A `grpc://` or `grpc+tls://` URL opens a Flight service's data in a tab
   that fills as it arrives. After `#`, say what to ask for: `sql=QUERY` (a Flight SQL
   server), `path=A/B` (a dataset by its path) or `ticket=T`. `key=COLUMN` keeps the latest

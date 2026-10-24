@@ -149,7 +149,7 @@ impl FlightSpec {
             _ => {
                 return Err(format!(
                     "unknown Flight option {}: Studio knows sql=QUERY, path=A/B, ticket=T, \
-                     key=COLUMN, header=NAME:VALUE, name=TABLE and {}",
+                     key=COLUMN, header=NAME:VALUE, name=TABLE, {}",
                     option_text(option, &value),
                     TimeOptions::KNOWN
                 ))
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(error, "time needs a value");
         let error = FlightSpec::parse("grpc://h#path=a&later=1").unwrap_err();
         assert!(
-            error.ends_with("and time=COLUMN, unit=s and window=10m"),
+            error.ends_with("name=TABLE, time=COLUMN, unit=s, window=10m and per=1m"),
             "{error}"
         );
     }

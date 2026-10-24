@@ -15,6 +15,7 @@ use densa_files::{Loader, OpenOptions};
 use densa_ui::{Ui, WidgetId};
 use densa_widgets::{DataGrid, DockArea, DockAt, DockPanel, Panel};
 
+use crate::counts::Counted;
 use crate::flight::{Fetch, FlightSpec};
 use crate::listing;
 use crate::stream::{Arrived, Live, StreamSpec};
@@ -146,6 +147,9 @@ pub(crate) struct Source {
     time_off: Option<String>,
     /// Why the window could not keep the table, if it could not.
     window_off: Option<String>,
+    /// The rows counted per bucket of the time column, in a tab of their own: for a remote
+    /// source that says `per=`.
+    pub(crate) counts: Option<Counted>,
     /// For a list of a Flight SQL service's tables: what was asked, to ask for a table.
     listing: Option<FlightSpec>,
     /// Rows in batches the table refused, and why the last one was.
@@ -212,6 +216,7 @@ impl Source {
         };
         let mut source = Self::new(name, origin, panel, grid, feed);
         source.time = spec.time.clone();
+        source.counts = counted(ui, dock, &source)?;
         // Nothing for SQL until its rows show their columns.
         source.changed = false;
         Ok(source)
@@ -238,6 +243,7 @@ impl Source {
         };
         let mut source = Self::new(name, origin, panel, grid, feed);
         source.time = spec.time.clone();
+        source.counts = counted(ui, dock, &source)?;
         source.listing = spec.lists_tables().then(|| spec.clone());
         // Nothing for SQL until its columns come.
         source.changed = false;
@@ -254,6 +260,7 @@ impl Source {
             time: None,
             time_off: None,
             window_off: None,
+            counts: None,
             listing: None,
             skipped: 0,
             refused: None,
@@ -276,8 +283,16 @@ impl Source {
         matches!(self.feed, Feed::Stream { .. })
     }
 
-    /// Takes in the rows read so far, until `deadline`. Whether some are left.
+    /// Takes in the rows read so far, until `deadline`, then charts the rows counted per
+    /// bucket. Whether some rows, or counts to chart, are left.
     pub(crate) fn take(&mut self, ui: &mut Ui, deadline: Instant) -> bool {
+        let rows = self.take_rows(ui, deadline);
+        let counts = self.refresh_counts(ui);
+        rows || counts
+    }
+
+    /// Takes in the rows read so far, until `deadline`. Whether some are left.
+    fn take_rows(&mut self, ui: &mut Ui, deadline: Instant) -> bool {
         while Instant::now() < deadline {
             let next = match &mut self.feed {
                 Feed::File {
@@ -410,6 +425,9 @@ impl Source {
             // are shown without it, and the status bar says why.
             self.window_off = time.apply(&mut table).err();
         }
+        if let Some(counts) = &mut self.counts {
+            counts.count(ui, &mut table);
+        }
         ui.update::<Grid, _>(self.grid, |grid, cx| {
             *grid.model_mut(cx).table_mut() = table
         });
@@ -430,6 +448,9 @@ impl Source {
         self.skipped = 0;
         self.refused = None;
         self.window_off = None;
+        if let Some(counts) = &mut self.counts {
+            counts.wait(ui);
+        }
         if let Err(error) = self.ready_table(ui, columns) {
             // The last try's rows go all the same: a table of the key alone, until columns
             // that can make one come.
@@ -441,6 +462,19 @@ impl Source {
             self.refused = Some(error);
         }
         self.changed = true;
+    }
+
+    /// Charts the rows counted per bucket, if they are and they changed. Whether changed
+    /// counts are left to chart at a later frame.
+    fn refresh_counts(&mut self, ui: &mut Ui) -> bool {
+        let Some(counts) = &mut self.counts else {
+            return false;
+        };
+        let Some(grid) = ui.widget::<Grid>(self.grid) else {
+            return false;
+        };
+        let read = counts.read(grid.model().table());
+        counts.show(ui, read)
     }
 
     /// Whether the first query should wait for this source: a file or a Flight result being
@@ -506,6 +540,9 @@ impl Source {
             (Some(off), _) => notes.push(format!("window off: {off}")),
             (None, Some(window)) => notes.push(window),
             (None, None) => {}
+        }
+        if let Some(off) = self.counts.as_ref().and_then(|c| c.off.as_ref()) {
+            notes.push(format!("counts off: {off}"));
         }
         if !notes.is_empty() {
             text.push_str(&format!(" ({})", notes.join("; ")));
@@ -573,6 +610,29 @@ fn add_tab(
         Grid::style(),
     )?;
     Ok((panel, grid))
+}
+
+/// The tab counting `source`'s rows per bucket of its time column, below its own tab and
+/// named after its table, if it says `per=`.
+fn counted(
+    ui: &mut Ui,
+    dock: WidgetId,
+    source: &Source,
+) -> Result<Option<Counted>, Box<dyn Error>> {
+    let Some(time) = &source.time else {
+        return Ok(None);
+    };
+    let Some(every) = time.per else {
+        return Ok(None);
+    };
+    let counted = Counted::open(
+        ui,
+        dock,
+        source.panel,
+        (&source.name, &source.origin),
+        (&time.column, every, time.window),
+    )?;
+    Ok(Some(counted))
 }
 
 /// A stream's columns before its first rows: its key alone.

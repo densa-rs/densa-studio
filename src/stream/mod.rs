@@ -104,7 +104,7 @@ impl StreamSpec {
                 _ => {
                     return Err(format!(
                         "unknown stream option {}: Studio knows key=COLUMN, subscribe=TEXT \
-                         (with & written %26), arrow, header=NAME:VALUE, name=TABLE and {}",
+                         (with & written %26), arrow, header=NAME:VALUE, name=TABLE, {}",
                         option_text(&name, &value),
                         TimeOptions::KNOWN
                     ))

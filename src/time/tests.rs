@@ -55,7 +55,7 @@ fn windowed(spec: &TimeSpec, time: ArrayRef) -> LiveTable {
 
 #[test]
 fn spans_are_a_number_and_a_unit() {
-    let secs = |text| span(text).map(|d| d.as_secs_f64());
+    let secs = |text| span("window", text).map(|d| d.as_secs_f64());
     assert_eq!(secs("500ms"), Ok(0.5));
     assert_eq!(secs("30s"), Ok(30.0));
     assert_eq!(secs("10m"), Ok(600.0));
@@ -64,12 +64,23 @@ fn spans_are_a_number_and_a_unit() {
     assert_eq!(secs("2d"), Ok(172_800.0));
     assert_eq!(secs("366d"), Ok(MOST.as_secs_f64()));
     let huge = format!("{}d", "9".repeat(400));
-    assert!(span(&huge).unwrap_err().contains("longer than a year"));
+    assert!(span("window", &huge)
+        .unwrap_err()
+        .contains("longer than a year"));
     for wrong in ["10", "m", "10x", "1.2.3s", "-5m", "", "10 m"] {
-        assert!(span(wrong).unwrap_err().contains("such as"), "{wrong}");
+        assert!(
+            span("window", wrong).unwrap_err().contains("such as"),
+            "{wrong}"
+        );
     }
-    assert!(span("0s").unwrap_err().contains("keeps nothing"));
-    assert!(span("367d").unwrap_err().contains("longer than a year"));
+    assert_eq!(
+        span("window", "0s").unwrap_err(),
+        "window=0s is no time at all: write a span such as 30s, 10m, 2h or 1d"
+    );
+    assert!(span("per", "10x").unwrap_err().starts_with("per=10x: "));
+    assert!(span("window", "367d")
+        .unwrap_err()
+        .contains("longer than a year"));
 }
 
 #[test]
@@ -88,18 +99,28 @@ fn the_options_go_together() {
         ["time=t", "window=10m"],
         "one span, one way"
     );
+    let counted = spec(&[("time", "t"), ("per", "60s"), ("window", "1h")]);
+    assert_eq!(counted.per, Some(Duration::from_secs(60)));
+    assert_eq!(counted.options(), ["time=t", "window=1h", "per=1m"]);
     let spaced = spec(&[("time", "a b"), ("unit", "us")]);
     assert_eq!(spaced.options(), ["time=a%20b", "unit=us"]);
 
     let error = time(&[("window", "1m")]).unwrap_err();
     assert!(error.contains("time=COLUMN"), "{error}");
+    let error = time(&[("per", "1m")]).unwrap_err();
+    assert_eq!(error, "per= needs the column of times: time=COLUMN");
     let error = time(&[("unit", "s")]).unwrap_err();
     assert_eq!(error, "unit= goes with the column of times: time=COLUMN");
     assert!(time(&[("unit", "h")])
         .unwrap_err()
         .contains("s, ms, us or ns"));
     assert_eq!(time(&[("time", "")]), Err("time needs a value".into()));
-    for (twice, value) in [("time", "t"), ("unit", "s"), ("window", "1m")] {
+    for (twice, value) in [
+        ("time", "t"),
+        ("unit", "s"),
+        ("window", "1m"),
+        ("per", "1s"),
+    ] {
         let error = time(&[(twice, value), (twice, value)]).unwrap_err();
         assert_eq!(error, format!("{twice}= is given twice"));
     }
@@ -108,7 +129,7 @@ fn the_options_go_together() {
 
 #[test]
 fn spans_are_written_in_their_largest_whole_unit() {
-    let text = |s| written(span(s).unwrap());
+    let text = |s| written(span("window", s).unwrap());
     assert_eq!(text("1.5h"), "90m");
     assert_eq!(text("48h"), "2d");
     assert_eq!(text("0.25s"), "250ms");
@@ -116,7 +137,11 @@ fn spans_are_written_in_their_largest_whole_unit() {
     assert_eq!(text("0.5ms"), "0.5ms");
     assert_eq!(text("90s"), "90s");
     for given in ["1.5h", "0.5ms", "1d", "1001ms"] {
-        assert_eq!(span(&text(given)), span(given), "{given} reads back");
+        assert_eq!(
+            span("window", &text(given)),
+            span("window", given),
+            "{given} reads back"
+        );
     }
 }
 

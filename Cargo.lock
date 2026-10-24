@@ -2063,8 +2063,7 @@ dependencies = [
 [[package]]
 name = "densa-arrow"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bda623141c8c7b611e64b16695afe41400a5e7a0361e1e787811818a71de06d"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "arrow-array 60.0.0",
  "arrow-buffer 60.0.0",
@@ -2078,8 +2077,7 @@ dependencies = [
 [[package]]
 name = "densa-chart"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae0b8013bd40ba5b570a7b69095659b676af082482f0ab48f38d862a11b6fbfe"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "densa-core",
  "densa-draw",
@@ -2090,14 +2088,12 @@ dependencies = [
 [[package]]
 name = "densa-core"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c46ada15467c7c48009a9f8faf8783b9e36598afeb39962a8919978fb46add5e"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 
 [[package]]
 name = "densa-data"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fcf5b1d15276e9cff1fb53b595a350996bb2e94d144cb6055ec90800125942f"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "arrow-array 60.0.0",
  "arrow-schema 60.0.0",
@@ -2121,8 +2117,7 @@ dependencies = [
 [[package]]
 name = "densa-draw"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ca4faeaf8fe51ab0bb032dd101d4cc6922c46806049cd3c2de112240db3a893"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "bytemuck",
  "densa-core",
@@ -2157,14 +2152,12 @@ dependencies = [
 [[package]]
 name = "densa-fmt"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d182e64f911e92149e885eb05f7060084021baedbb74162c0a109bbab4e61a9f"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 
 [[package]]
 name = "densa-grid"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bff1b910dbe4035a214df6d4e6df65496a386c78e1cfc4571363c59ab25d700"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "densa-core",
  "densa-draw",
@@ -2175,8 +2168,7 @@ dependencies = [
 [[package]]
 name = "densa-paragraph"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22b14e76539fa18b90eab08419a648a90e592f6887608ca135b6250a092b88a5"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "densa-core",
  "densa-text",
@@ -2188,8 +2180,7 @@ dependencies = [
 [[package]]
 name = "densa-render"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c9dd783c2778ac8d9a17166ee39897585378f5b57e5a8a73c27d4daa894a93f"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "bytemuck",
  "densa-core",
@@ -2229,8 +2220,7 @@ dependencies = [
 [[package]]
 name = "densa-text"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "310c0a4599ad8fcaf3f2bfff6d9df17f8da07a4f0aeb2901c59167afb91bb3da"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "densa-core",
  "etagere",
@@ -2242,8 +2232,7 @@ dependencies = [
 [[package]]
 name = "densa-ui"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38f8694b2cb5fa71cc93540763cbb97c7d391efc4ea0b5b8d55d1fe3e1d00926"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "densa-core",
  "densa-draw",
@@ -2254,8 +2243,7 @@ dependencies = [
 [[package]]
 name = "densa-widgets"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "466d18f5f8b3a667f480ee954295681eb1ab973547299839f18ee2c83525bb06"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "densa-chart",
  "densa-core",
@@ -2269,8 +2257,7 @@ dependencies = [
 [[package]]
 name = "densa-window"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96856c1a707e44a8ba69db68b1f87db7982d586745c3b1d58744e6b4d71059dc"
+source = "git+https://github.com/densa-rs/densa#af76b26eaa7d7537c6c3ea30448bb9ab210acf85"
 dependencies = [
  "accesskit",
  "accesskit_winit",

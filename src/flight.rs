@@ -10,6 +10,7 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use densa_flight::{FlightEvent, FlightOptions, FlightStream};
 
+use crate::join::JoinSpec;
 use crate::stream::{
     encode, header, header_value, option_text, options, parts, shortened, Arrived, Keying,
 };
@@ -51,6 +52,8 @@ pub(crate) struct FlightSpec {
     pub(crate) name: Option<String>,
     /// The column of the rows' times, and the window kept over it, if given.
     pub(crate) time: Option<TimeSpec>,
+    /// The open table its rows are joined to, if any.
+    pub(crate) join: Option<JoinSpec>,
 }
 
 impl fmt::Debug for FlightSpec {
@@ -63,6 +66,7 @@ impl fmt::Debug for FlightSpec {
             .field("headers", &headers)
             .field("name", &self.name)
             .field("time", &self.time)
+            .field("join", &self.join)
             .finish()
     }
 }
@@ -98,6 +102,7 @@ impl FlightSpec {
             headers: Vec::new(),
             name: None,
             time: None,
+            join: None,
         };
         let mut asked = None;
         let mut time = TimeOptions::default();
@@ -142,6 +147,11 @@ impl FlightSpec {
             "ticket" => Request::Ticket(value),
             "key" => return once(&mut self.key, option, value).map(|()| None),
             "name" => return once(&mut self.name, option, value).map(|()| None),
+            "join" if self.join.is_some() => return Err("join= is given twice".to_owned()),
+            "join" => {
+                self.join = Some(JoinSpec::parse(&value)?);
+                return Ok(None);
+            }
             "header" => {
                 self.headers.push(header(&value)?);
                 return Ok(None);
@@ -149,8 +159,9 @@ impl FlightSpec {
             _ => {
                 return Err(format!(
                     "unknown Flight option {}: Studio knows sql=QUERY, path=A/B, ticket=T, \
-                     key=COLUMN, header=NAME:VALUE, name=TABLE, {}",
+                     key=COLUMN, header=NAME:VALUE, name=TABLE, {}, {}",
                     option_text(option, &value),
+                    JoinSpec::KNOWN,
                     TimeOptions::KNOWN
                 ))
             }
@@ -213,6 +224,10 @@ impl FlightSpec {
             origin.push('&');
             origin.push_str(&option);
         }
+        for option in self.join.iter().map(JoinSpec::option) {
+            origin.push('&');
+            origin.push_str(&option);
+        }
         origin
     }
 
@@ -267,6 +282,7 @@ impl FlightSpec {
             headers: self.headers.clone(),
             name: Some(table.to_owned()),
             time: None,
+            join: None,
         }
     }
 
@@ -491,7 +507,9 @@ mod tests {
         assert_eq!(error, "time needs a value");
         let error = FlightSpec::parse("grpc://h#path=a&later=1").unwrap_err();
         assert!(
-            error.ends_with("name=TABLE, time=COLUMN, unit=s, window=10m and per=1m"),
+            error.ends_with(
+                "name=TABLE, join=COLUMN:TABLE, time=COLUMN, unit=s, window=10m and per=1m"
+            ),
             "{error}"
         );
     }

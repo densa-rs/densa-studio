@@ -3,7 +3,7 @@
 //! arrangement is kept between runs.
 //!
 //! `densa-studio [FILE or ws://URL...]`, `--sample` to open a million sample web requests and
-//! a local stream of sensor readings, `--query SQL` to run once the files have loaded, `--live`
+//! a local stream of sensor readings joined to their sites, `--query SQL` to run once the files have loaded, `--live`
 //! to run it again each second while sources change, `--light` for the light theme, `--fresh`
 //! to ignore the saved arrangement, `--seconds N` to close after N seconds.
 
@@ -12,6 +12,7 @@ mod chart;
 mod config;
 mod counts;
 mod flight;
+mod join;
 mod listing;
 mod query;
 mod sample;
@@ -41,11 +42,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         sources.push(requests.display().to_string());
         let flight = samples::flight_server()?;
         sources.push(format!("{flight}#tables"));
+        sources.push(sample::sites()?.display().to_string());
         let readings = samples::readings_server()?;
         // Every reading of the last minute, counted per second, then each sensor's latest
-        // (in front, as its values change in place).
+        // with its site's columns (in front, as its values change in place).
         sources.push(format!("{readings}#time=time&window=1m&per=1s&name=recent"));
-        sources.push(format!("{readings}#key=sensor&time=time"));
+        sources.push(format!("{readings}#key=sensor&time=time&join=site:sites"));
     }
     let studio = studio::Studio::new(studio::Start {
         sources,

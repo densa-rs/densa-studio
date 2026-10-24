@@ -28,8 +28,9 @@ const WELCOME: &str = "Open a CSV or Parquet file, a ws:// stream or a grpc:// F
                        files on the window, or start Studio with them. Each opens in a tab of \
                        its own that fills as rows come, and the SQL panel queries every one \
                        by its name. After a URL's #, key=COLUMN keeps the latest row of each \
-                       key, time=COLUMN shows its times as times, and tables lists a Flight \
-                       SQL server's tables.";
+                       key, time=COLUMN shows its times as times, join=COLUMN:TABLE adds the \
+                       columns of the row it names in another open table, and tables lists \
+                       a Flight SQL server's tables.";
 
 /// Files named in the status bar while held over the window, at most.
 const HOVER_NAMES: usize = 3;
@@ -446,6 +447,8 @@ impl App for Studio {
         if count > 0 {
             self.first_source = (self.first_source + 1) % count;
         }
+        // Rows taken in above reach the sources joined to their tables.
+        crate::join::link(ui, &mut self.sources);
         // Streams never finish, and a service not there may never answer: the first query
         // waits for files and Flight results being read.
         let loading = self.sources.iter().any(Source::blocks_query);

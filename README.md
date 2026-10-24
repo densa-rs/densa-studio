@@ -10,9 +10,9 @@ of live data, and on its [connectors](https://github.com/densa-rs/densa-connecto
   <img alt="densa studio: a live stream of 500 sensors in a grid; below it a live SQL query counting the sensors at each temperature, its result, and a chart of it, all updating each second" src="https://raw.githubusercontent.com/densa-rs/densa-studio/main/docs/studio.png" width="760">
 </p>
 
-> **Status: 0.1, experimental.** Studio is installed from this repository. It uses densa 0.2
-> from crates.io, and densa's connectors from their main branch (pinned in `Cargo.lock`)
-> until they are released.
+> **Status: 0.1, experimental.** Studio is installed from this repository. It uses densa and
+> its connectors from their main branches (pinned in `Cargo.lock`): densa until its next
+> release, which brings the lookup joins, the connectors until they are released.
 
 ## Install and run
 
@@ -23,9 +23,10 @@ cargo install --locked --git https://github.com/densa-rs/densa-studio
 densa-studio trips.parquet zones.csv
 densa-studio --sample        # a million sample web requests (written to your cache
                              # folder the first time) and a local stream of 500 sensors:
-                             # `readings` (each sensor's latest) and `recent` (the last minute,
-                             # counted per second), their `time` column as timestamps, and a
-                             # local Flight SQL service's list of tables
+                             # `readings` (each sensor's latest, joined to its site's row of
+                             # `sites.csv`) and `recent` (the last minute, counted per second),
+                             # their `time` column as timestamps, and a local Flight SQL
+                             # service's list of tables
 densa-studio "wss://example.com/trades#key=id"
 densa-studio "grpc+tls://flight.example.com:443#sql=SELECT * FROM trips&header=authorization:Bearer $TOKEN"
 ```
@@ -86,6 +87,22 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   counts each key once, in the minute of its latest row. Buckets run back to back from 1970
   in UTC, so `per=1d` days start at midnight UTC and `per=7d` weeks on Thursdays; rows without
   a time are left out, and the tab says how many.
+- **Lookup joins, live.** With `join=COLUMN:TABLE` after `#`, a stream's or Flight source's
+  rows show the columns of the row of another open table whose column of the same name holds
+  the same value (`join=COLUMN:TABLE.KEY` when that column has another name), so
+  `ws://host/readings#key=sensor&join=site:sites` gives each reading its site's region and
+  height from `sites.csv`. Both sides stay current: rows are joined as they arrive, and a
+  row of the other table that arrives or changes (a file still loading, a stream of
+  reference data) updates every row naming it at once; rows that leave it (a window, a row
+  replaced by one naming another key) leave the joined rows within a second. Rows naming
+  nothing show empty columns. A column name both tables have gets the other table's name in
+  front (`sites_name`), and the row numbers Studio gives a file are left out. The other
+  table can be a file, a stream or a Flight result, opened before or after; it cannot have
+  a `join=` of its own. Its rows without a value in that column name nothing; when several
+  rows hold one value, the last to arrive is the one joined. A Flight result read again is
+  joined anew, even with other columns; if it can no longer be joined (its column is gone),
+  the source shows its own columns again. The status bar says what each source is joined
+  with, or why it is not. SQL, the window and the counts see the joined rows.
 - **Arrow Flight.** A `grpc://` or `grpc+tls://` URL opens a Flight service's data in a tab
   that fills as it arrives. After `#`, say what to ask for: `sql=QUERY` (a Flight SQL
   server), `path=A/B` (a dataset by its path) or `ticket=T`. `key=COLUMN` keeps the latest

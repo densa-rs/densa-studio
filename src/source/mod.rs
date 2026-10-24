@@ -17,6 +17,7 @@ use densa_widgets::{DataGrid, DockArea, DockAt, DockPanel, Panel};
 
 use crate::counts::Counted;
 use crate::flight::{Fetch, FlightSpec};
+use crate::join::{Joined, Offer, Stepped};
 use crate::listing;
 use crate::stream::{Arrived, Live, StreamSpec};
 use crate::time::TimeSpec;
@@ -116,6 +117,8 @@ enum Feed {
     /// A file read once, to its end.
     File {
         loader: Loader,
+        /// The column numbering its rows.
+        key: String,
         /// The rows the file says it has, if it says.
         total: Option<u64>,
         done: bool,
@@ -152,6 +155,18 @@ pub(crate) struct Source {
     pub(crate) counts: Option<Counted>,
     /// For a list of a Flight SQL service's tables: what was asked, to ask for a table.
     listing: Option<FlightSpec>,
+    /// Its join to another open table: for a remote source that says `join=`.
+    pub(crate) joined: Option<Joined>,
+    /// Studio numbers its rows (it has no key of its own).
+    numbered: bool,
+    /// A source is joined to this one: the rows its table takes are kept for it.
+    pub(crate) watched: bool,
+    /// The rows its table took since the sources joined to it last took them.
+    arrived: Vec<RecordBatch>,
+    /// How many times rows left its table, and were replaced in it: a source joined to it
+    /// then looks for rows that left.
+    deletions: u64,
+    updates: u64,
     /// Rows in batches the table refused, and why the last one was.
     skipped: u64,
     refused: Option<String>,
@@ -189,6 +204,7 @@ impl Source {
         let loader = Loader::spawn(reader, wake)?;
         let feed = Feed::File {
             loader,
+            key,
             total,
             done: false,
             failed: None,
@@ -217,6 +233,8 @@ impl Source {
         let mut source = Self::new(name, origin, panel, grid, feed);
         source.time = spec.time.clone();
         source.counts = counted(ui, dock, &source)?;
+        source.joined = spec.join.clone().map(Joined::new);
+        source.numbered = spec.key.is_none();
         // Nothing for SQL until its rows show their columns.
         source.changed = false;
         Ok(source)
@@ -245,6 +263,8 @@ impl Source {
         source.time = spec.time.clone();
         source.counts = counted(ui, dock, &source)?;
         source.listing = spec.lists_tables().then(|| spec.clone());
+        source.joined = spec.join.clone().map(Joined::new);
+        source.numbered = spec.key.is_none();
         // Nothing for SQL until its columns come.
         source.changed = false;
         Ok(source)
@@ -262,6 +282,12 @@ impl Source {
             window_off: None,
             counts: None,
             listing: None,
+            joined: None,
+            numbered: true,
+            watched: false,
+            arrived: Vec::new(),
+            deletions: 0,
+            updates: 0,
             skipped: 0,
             refused: None,
             changed: true,
@@ -383,28 +409,43 @@ impl Source {
         deleted: Option<arrow_array::UInt64Array>,
     ) {
         let rows = batch.num_rows() as u64;
-        let refused = match self.ready_table(ui, &batch) {
-            Err(error) => Some(error),
-            Ok(()) => {
-                let mut refused = None;
-                ui.update::<Grid, _>(self.grid, |grid, cx| {
-                    let table = grid.model_mut(cx).table_mut();
-                    refused = table.upsert(batch).err().map(|e| e.to_string());
-                    // Numbered rows too old to keep go even when these rows were refused:
-                    // their numbers are never offered again.
-                    if let Some(deleted) = deleted {
-                        let _ = table.delete(&deleted);
-                    }
-                });
-                refused
+        if let Err(error) = self.ready_table(ui, &batch) {
+            self.skipped += rows;
+            self.refused = Some(error);
+            return;
+        }
+        // Kept for the sources joined to this one, if it takes them.
+        let copy = self.watched.then(|| batch.clone());
+        let joined = &mut self.joined;
+        let (mut taken, mut gone) = (None, 0);
+        ui.update::<Grid, _>(self.grid, |grid, cx| {
+            let table = grid.model_mut(cx).table_mut();
+            taken = Some(match joined.as_mut().and_then(|j| j.join_for(table)) {
+                Some(join) => join.upsert_left(table, batch),
+                None => table.upsert(batch),
+            });
+            // Numbered rows too old to keep go even when these rows were refused: their
+            // numbers are never offered again.
+            if let Some(deleted) = deleted {
+                gone = table.delete(&deleted).map_or(0, |changes| changes.deleted);
             }
-        };
-        match refused {
-            Some(error) => {
+        });
+        if gone > 0 {
+            self.deletions += 1;
+        }
+        match taken {
+            Some(Ok(changes)) => {
+                self.deletions += u64::from(changes.deleted > 0);
+                self.updates += u64::from(changes.updated > 0);
+                self.arrived.extend(copy);
+                self.changed = true;
+            }
+            Some(Err(error)) => {
                 self.skipped += rows;
-                self.refused = Some(error);
+                self.refused = Some(error.to_string());
             }
-            None => self.changed = true,
+            // The tab is gone.
+            None => {}
         }
     }
 
@@ -419,7 +460,16 @@ impl Source {
         if *started {
             return Ok(());
         }
-        let mut table = LiveTable::new(batch.schema(), key).map_err(|e| e.to_string())?;
+        let table = LiveTable::new(batch.schema(), key).map_err(|e| e.to_string())?;
+        *started = true;
+        // A join made notices the table is not its own, and is made anew.
+        self.install(ui, table);
+        Ok(())
+    }
+
+    /// Shows `table` (a table of this source's made anew) in the grid, kept to the window
+    /// and counted if the source says so.
+    fn install(&mut self, ui: &mut Ui, mut table: LiveTable) {
         if let Some(time) = &self.time {
             // A window that cannot apply now never will (the columns are settled): the rows
             // are shown without it, and the status bar says why.
@@ -431,8 +481,79 @@ impl Source {
         ui.update::<Grid, _>(self.grid, |grid, cx| {
             *grid.model_mut(cx).table_mut() = table
         });
-        *started = true;
-        Ok(())
+    }
+
+    /// Whether its table has its columns: a remote source's is made with its first rows.
+    fn is_started(&self) -> bool {
+        !matches!(
+            self.feed,
+            Feed::Stream { started: false, .. } | Feed::Flight { started: false, .. }
+        )
+    }
+
+    /// The column that keys its rows.
+    fn key(&self) -> &str {
+        key_of(&self.feed)
+    }
+
+    /// What it offers the sources joined to it for this frame: the rows its table took
+    /// since the last one, and how its table stands.
+    pub(crate) fn offer(&mut self, ui: &Ui) -> Offer {
+        let table = ui
+            .widget::<Grid>(self.grid)
+            .map(|grid| grid.model().table());
+        let started = self.is_started();
+        Offer {
+            instance: table.filter(|_| started).map(LiveTable::instance),
+            schema: table.map_or_else(|| Arc::new(Schema::empty()), |t| t.schema().clone()),
+            arrived: std::mem::take(&mut self.arrived),
+            deletions: self.deletions,
+            updates: self.updates,
+            key: self.key().to_owned(),
+            numbered: self.numbered,
+            joined: self.joined.is_some(),
+        }
+    }
+
+    /// Takes in what the table it is joined to offers (`None`: no table of that name is
+    /// open; `itself`: it names its own), and `all` that table's rows when the join asked
+    /// for them; shows the joined rows once the join is made.
+    pub(crate) fn link(
+        &mut self,
+        ui: &mut Ui,
+        offer: Option<&Offer>,
+        all: Option<Vec<RecordBatch>>,
+        itself: bool,
+    ) {
+        if !self.is_started() {
+            return;
+        }
+        let key = key_of(&self.feed);
+        let Some(joined) = &mut self.joined else {
+            return;
+        };
+        if itself {
+            joined.refuse("a table cannot be joined to itself");
+            return;
+        }
+        let Some(ready) = joined.ready(offer) else {
+            return;
+        };
+        if joined.is_idle(ready.0, ready.1, all.is_some()) {
+            return;
+        }
+        let mut stepped = Stepped::Nothing;
+        ui.update::<Grid, _>(self.grid, |grid, cx| {
+            stepped = joined.step(grid.model_mut(cx).table_mut(), key, ready, all);
+        });
+        match stepped {
+            Stepped::Nothing => {}
+            Stepped::Changed => self.changed = true,
+            Stepped::Replaced(table) => {
+                self.install(ui, *table);
+                self.changed = true;
+            }
+        }
     }
 
     /// A table of `columns`, made anew: a Flight result starts (over).
@@ -544,6 +665,9 @@ impl Source {
         if let Some(off) = self.counts.as_ref().and_then(|c| c.off.as_ref()) {
             notes.push(format!("counts off: {off}"));
         }
+        if let Some(joined) = &self.joined {
+            notes.push(joined.describe());
+        }
         if !notes.is_empty() {
             text.push_str(&format!(" ({})", notes.join("; ")));
         }
@@ -573,6 +697,15 @@ impl Source {
         let table = grid.model().table();
         let batches = table.snapshot().map_err(|e| e.to_string())?;
         Ok((table.schema().clone(), batches))
+    }
+}
+
+/// The column that keys the rows of `feed`.
+fn key_of(feed: &Feed) -> &str {
+    match feed {
+        Feed::File { key, .. } => key,
+        Feed::Stream { live, .. } => live.key(),
+        Feed::Flight { fetch, .. } => fetch.key(),
     }
 }
 

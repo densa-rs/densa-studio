@@ -50,8 +50,8 @@ unsafe_code = "forbid"
 [profile.release]
 debug = 1
 
-# Files dropped on the window (densa_window::FileDrop) are newer than densa 0.2.1: until the
-# next release, densa comes from its main branch (Cargo.lock pins the commit).
+# Files dropped on the window (densa_window::FileDrop) and category axes are newer than densa
+# 0.2.1: until the next release, densa comes from its main branch (Cargo.lock pins the commit).
 [patch.crates-io]
 densa-arrow = { git = "https://github.com/densa-rs/densa" }
 densa-chart = { git = "https://github.com/densa-rs/densa" }

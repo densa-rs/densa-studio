@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Date32Array, Float64Array, Int64Array, StringArray};
+use arrow_array::types::Int8Type;
+use arrow_array::{ArrayRef, BinaryArray, BooleanArray, DictionaryArray, StringViewArray};
+use arrow_array::{Date32Array, Float64Array, Int64Array, StringArray};
 use arrow_array::{Decimal128Array, TimestampMillisecondArray, UInt64Array};
 use arrow_schema::{Field, Schema};
 use densa_draw::{Instance, InstanceBuffer};
@@ -186,14 +188,16 @@ fn rows_without_a_place_across_are_left_out() {
 
 #[test]
 fn a_result_that_cannot_be_charted_says_why() {
-    let text_first = chart_of(vec![("service", texts(&["a"])), ("n", ints(&[1]))]);
-    assert_eq!(text_first.panes(), 1, "one empty pane");
+    let bytes: ArrayRef = Arc::new(BinaryArray::from_vec(vec![b"a"]));
+    let bytes_first = chart_of(vec![("blob", bytes), ("n", ints(&[1]))]);
+    assert_eq!(bytes_first.panes(), 1, "one empty pane");
     assert_eq!(
-        text_first.caption(),
-        "Not charted: the first column, service, is not a number, date or timestamp"
+        bytes_first.caption(),
+        "Not charted: the first column, blob, is not a number, date, timestamp or text"
     );
-    assert_eq!(text_first.x_extent(), None);
-    assert_eq!(text_first.pane_title(0), "");
+    assert_eq!(bytes_first.x_extent(), None);
+    assert_eq!(bytes_first.pane_title(0), "");
+    assert_eq!(bytes_first.category(0), None);
 
     let no_numbers = chart_of(vec![("x", ints(&[1])), ("name", texts(&["a"]))]);
     assert_eq!(
@@ -310,7 +314,8 @@ fn the_y_extent_is_found_again_when_rows_or_the_view_change() {
 
 #[test]
 fn rows_for_a_chart_that_shows_nothing_are_ignored() {
-    let rows = batch(0, vec![("service", texts(&["a"])), ("n", ints(&[1]))]);
+    let bytes: ArrayRef = Arc::new(BinaryArray::from_vec(vec![b"a"]));
+    let rows = batch(0, vec![("blob", bytes), ("n", ints(&[1]))]);
     let mut chart = Plotted::new(&rows.schema(), "#");
     assert_eq!(chart.add(&rows), Ok(()));
 }
@@ -432,4 +437,184 @@ fn a_frame_of_a_million_rows_in_four_panes() {
         }
         println!("a frame: {:?}", started.elapsed());
     }
+}
+
+#[test]
+fn a_text_first_column_makes_a_bar_for_each_row_in_the_results_order() {
+    let mut chart = chart_of(vec![
+        ("service", texts(&["web", "db", "web"])),
+        ("count", ints(&[30, 10, 20])),
+        ("note", texts(&["x", "y", "z"])),
+        ("mean", floats(&[1.5, 2.5, 3.5])),
+    ]);
+    assert_eq!(chart.x_kind(), AxisKind::Category);
+    assert_eq!(
+        chart.caption(),
+        "Bars of count, mean, a bar for each service"
+    );
+    assert_eq!(chart.panes(), 2);
+    assert_eq!(points(&chart, 0), [(0.0, 30.0), (1.0, 10.0), (2.0, 20.0)]);
+    assert_eq!(points(&chart, 1)[2], (2.0, 3.5));
+    let names: Vec<_> = (0..4).map(|i| chart.category(i)).collect();
+    assert_eq!(
+        names,
+        [Some("web"), Some("db"), Some("web"), None],
+        "repeats keep their bar"
+    );
+    assert_eq!(
+        chart.x_extent(),
+        Some((-0.5, 2.5)),
+        "each bar's room in sight"
+    );
+    assert_eq!(chart.x_step(), Some(1.0));
+    assert_eq!(chart.mark_row(Some(1)), Some(1.0));
+
+    chart
+        .add(&batch(
+            3,
+            vec![
+                ("service", texts(&["cache"])),
+                ("count", ints(&[5])),
+                ("note", texts(&["w"])),
+                ("mean", floats(&[0.5])),
+            ],
+        ))
+        .unwrap();
+    assert_eq!(
+        chart.category(3),
+        Some("cache"),
+        "more rows, more bars after"
+    );
+    assert_eq!(points(&chart, 0)[3], (3.0, 5.0));
+}
+
+#[test]
+fn bars_can_be_named_by_any_text_true_or_false_and_nulls() {
+    let names = |column: ArrayRef| {
+        let rows = column.len();
+        let chart = chart_of(vec![("name", column), ("n", ints(&vec![1; rows]))]);
+        assert_eq!(chart.x_kind(), AxisKind::Category);
+        (0..rows)
+            .map(|i| chart.category(i).unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let flags: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)]));
+    assert_eq!(names(flags), ["true", "null", "false"]);
+    let views: ArrayRef = Arc::new(StringViewArray::from(vec!["a long name past twelve", "b"]));
+    assert_eq!(names(views), ["a long name past twelve", "b"]);
+    let coded: DictionaryArray<Int8Type> = vec!["east", "west", "east"].into_iter().collect();
+    assert_eq!(names(Arc::new(coded)), ["east", "west", "east"]);
+    let gaps: ArrayRef = Arc::new(StringArray::from(vec![None, Some("b")]));
+    assert_eq!(names(gaps), ["null", "b"]);
+}
+
+#[test]
+fn rows_without_a_row_number_get_no_bar() {
+    let keys: ArrayRef = Arc::new(UInt64Array::from(vec![Some(0), None, Some(2)]));
+    let rows = RecordBatch::try_from_iter([
+        ("name", texts(&["a", "b", "c"])),
+        ("n", ints(&[1, 2, 3])),
+        ("#", keys),
+    ])
+    .unwrap();
+    let mut chart = Plotted::new(&rows.schema(), "#");
+    chart.add(&rows).unwrap();
+    assert_eq!(points(&chart, 0), [(0.0, 1.0), (1.0, 3.0)]);
+    assert_eq!(chart.category(1), Some("c"));
+}
+
+#[test]
+fn bars_rise_from_zero_and_their_scale_shows_it() {
+    let chart = chart_of(vec![("name", texts(&["a", "b"])), ("n", ints(&[40, 50]))]);
+    let y = chart.y_axis(0, &Axis::category(-0.5, 1.5)).unwrap();
+    assert!(y.start() < 0.0 && y.end() > 50.0, "{y:?}");
+    let below = chart_of(vec![("name", texts(&["a", "b"])), ("n", ints(&[-40, -50]))]);
+    let y = below.y_axis(0, &Axis::category(-0.5, 1.5)).unwrap();
+    assert!(y.start() < -50.0 && y.end() > 0.0, "{y:?}");
+    let line = chart_of(vec![("x", ints(&[1, 2])), ("n", ints(&[40, 50]))]);
+    let y = line.y_axis(0, &Axis::number(0.0, 3.0)).unwrap();
+    assert!(y.start() > 30.0, "a line keeps to its values: {y:?}");
+    assert_eq!(line.x_step(), None);
+    assert_eq!(line.x_extent(), Some((1.0, 2.0)));
+}
+
+#[test]
+fn bars_are_drawn_as_columns_without_dots_or_a_line() {
+    let chart = chart_of(vec![
+        ("name", texts(&["a", "b", "c"])),
+        ("n", ints(&[2, 5, 8])),
+    ]);
+    let mut cache = GlyphCache::new(AtlasConfig::default());
+    let mut out = InstanceBuffer::with_capacity(1_024);
+    let mut canvas = Canvas::begin(&mut cache, &mut out);
+    let plot = Plot::new(
+        Rect::new(0.0, 0.0, 300.0, 200.0),
+        Axis::category(-0.5, 2.5),
+        Axis::number(0.0, 10.0),
+    );
+    chart.paint(0, &plot, &mut canvas, &ChartPalette::new());
+    let bars: Vec<[f32; 4]> = out.as_slice().iter().map(|i| i.rect).collect();
+    assert_eq!(bars.len(), 3, "{bars:?}");
+    // A bar 70% of its 100 pixels wide, from zero (the bottom) to its value.
+    assert_eq!(bars[2][2], 70.0);
+    assert_eq!((bars[2][1], bars[2][3]), (40.0, 160.0));
+}
+
+#[test]
+fn the_marked_bar_has_its_whole_place_shaded_behind_it() {
+    let mut chart = chart_of(vec![
+        ("name", texts(&["a", "b", "c"])),
+        ("n", ints(&[2, 5, 8])),
+    ]);
+    chart.mark_row(Some(1));
+    let mut cache = GlyphCache::new(AtlasConfig::default());
+    let mut out = InstanceBuffer::with_capacity(1_024);
+    let mut canvas = Canvas::begin(&mut cache, &mut out);
+    let plot = Plot::new(
+        Rect::new(0.0, 0.0, 300.0, 200.0),
+        Axis::category(-0.5, 2.5),
+        Axis::number(0.0, 10.0),
+    );
+    chart.paint(0, &plot, &mut canvas, &ChartPalette::new());
+    let shade = ChartPalette::new().line.with_alpha(0.3).to_array();
+    let first = out.as_slice()[0];
+    assert_eq!(first.color, shade, "under the bars");
+    assert_eq!(first.rect, [100.0, 0.0, 100.0, 200.0]);
+}
+
+#[test]
+fn a_long_name_is_kept_to_what_could_show() {
+    let long = "é".repeat(NAME_CHARS + 50);
+    let chart = chart_of(vec![("name", texts(&[&long, "b"])), ("n", ints(&[1, 2]))]);
+    assert_eq!(chart.category(0).unwrap().chars().count(), NAME_CHARS);
+    let short = "é".repeat(NAME_CHARS);
+    let chart = chart_of(vec![("name", texts(&[&short])), ("n", ints(&[1]))]);
+    assert_eq!(chart.category(0), Some(short.as_str()));
+}
+
+#[test]
+fn a_marked_bar_half_in_sight_is_shaded_within_the_plot() {
+    let mut chart = chart_of(vec![
+        ("name", texts(&["a", "b", "c"])),
+        ("n", ints(&[2, 5, 8])),
+    ]);
+    chart.mark_row(Some(2));
+    let mut cache = GlyphCache::new(AtlasConfig::default());
+    let mut out = InstanceBuffer::with_capacity(1_024);
+    let mut canvas = Canvas::begin(&mut cache, &mut out);
+    // Bar 2's place runs 1.5..2.5: its left part is in sight of 0..1.8.
+    let plot = Plot::new(
+        Rect::new(0.0, 0.0, 180.0, 200.0),
+        Axis::category(0.0, 1.8),
+        Axis::number(0.0, 10.0),
+    );
+    chart.paint(0, &plot, &mut canvas, &ChartPalette::new());
+    let shade = ChartPalette::new().line.with_alpha(0.3).to_array();
+    let band: Vec<[f32; 4]> = out
+        .as_slice()
+        .iter()
+        .filter(|i| i.color == shade)
+        .map(|i| i.rect)
+        .collect();
+    assert_eq!(band, [[150.0, 0.0, 30.0, 200.0]], "cut at the plot's edge");
 }

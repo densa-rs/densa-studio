@@ -1,6 +1,7 @@
 //! The SQL result as a chart: its first column across, and each number column after it in a
 //! pane of its own, filling as the result arrives, in order of the first column whatever
-//! order the rows come in.
+//! order the rows come in. A first column of text (or true/false) makes a bar chart
+//! instead: a bar for each row, in the result's order, named by that column.
 //!
 //! Each column is read into plain numbers once, as its rows arrive: a chart reads every point
 //! in sight each frame, and slices of numbers are the cheapest thing to read them from.
@@ -10,12 +11,13 @@ use std::time::{Duration, Instant};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type, UInt64Type};
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_cast::cast;
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use densa_chart::{
-    paint_line, points_within, y_extent, Axis, AxisKind, ChartModel, ChartPalette, LineStyle, Plot,
-    Points, Rect,
+    paint_bars, paint_line, points_within, y_extent, Axis, AxisKind, BarStyle, ChartModel,
+    ChartPalette, LineStyle, Plot, Points, Rect,
 };
 use densa_draw::Canvas;
 
@@ -31,7 +33,8 @@ const DOT: f32 = 4.0;
 const SORT_EVERY: Duration = Duration::from_millis(300);
 /// What the chart says before a query has run.
 const WAITING: &str = "Run a query to chart it: its first column goes across (a number, date \
-                       or timestamp), and each number column after it gets a pane";
+                       or timestamp; text makes a bar for each row), and each number column \
+                       after it gets a pane";
 
 /// A query's result as a chart model.
 pub(crate) struct Plotted {
@@ -69,12 +72,14 @@ struct Extent {
     found: Option<(f64, f64)>,
 }
 
-/// Rows as numbers: each row's key, `x`, and a value per pane.
+/// Rows as numbers: each row's key, `x`, and a value per pane; and for bars, each one's
+/// name.
 #[derive(Default)]
 struct Rows {
     keys: Vec<u64>,
     xs: Vec<f64>,
     ys: Vec<Vec<f64>>,
+    names: Vec<Box<str>>,
 }
 
 impl Plotted {
@@ -171,9 +176,14 @@ impl Charted {
         let mut columns = (0..fields.len()).filter(|&i| i != key);
         let x = columns.next().ok_or("The result has no columns to chart")?;
         let x_name = fields[x].name().clone();
-        let kind = axis_kind(fields[x].data_type()).ok_or_else(|| {
-            format!("Not charted: the first column, {x_name}, is not a number, date or timestamp")
-        })?;
+        let kind = axis_kind(fields[x].data_type())
+            .or_else(|| is_text(fields[x].data_type()).then_some(AxisKind::Category))
+            .ok_or_else(|| {
+                format!(
+                    "Not charted: the first column, {x_name}, is not a number, date, timestamp \
+                     or text"
+                )
+            })?;
         let numeric: Vec<(usize, String)> = columns
             .filter(|&i| axis_kind(fields[i].data_type()) == Some(AxisKind::Number))
             .map(|i| (i, fields[i].name().clone()))
@@ -181,7 +191,7 @@ impl Charted {
         if numeric.is_empty() {
             return Err(format!("Not charted: no number column after {x_name}"));
         }
-        let caption = caption(&x_name, &numeric);
+        let caption = caption(&x_name, kind, &numeric);
         let panes: Vec<(usize, String)> = numeric.into_iter().take(MAX_PANES).collect();
         let empty = || Rows {
             ys: vec![Vec::new(); panes.len()],
@@ -208,12 +218,15 @@ impl Charted {
         let keys = keys
             .as_primitive_opt::<UInt64Type>()
             .ok_or("the row numbers are not unsigned integers")?;
-        let xs = numbers(batch.column(self.x).as_ref())?;
         let ys = self
             .panes
             .iter()
             .map(|&(column, _)| numbers(batch.column(column).as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
+        if self.kind == AxisKind::Category {
+            return self.add_bars(batch, keys, &ys);
+        }
+        let xs = numbers(batch.column(self.x).as_ref())?;
         let mut rows = Rows {
             ys: vec![Vec::new(); ys.len()],
             ..Rows::default()
@@ -234,6 +247,27 @@ impl Charted {
         } else {
             self.waiting.append(rows);
             self.sort_in(false);
+        }
+        Ok(())
+    }
+
+    /// Takes in `batch`'s rows as bars after the ones the chart has, each named by its `x`
+    /// (`null` for none), whose values per pane are `ys`.
+    fn add_bars(
+        &mut self,
+        batch: &RecordBatch,
+        keys: &UInt64Array,
+        ys: &[Vec<f64>],
+    ) -> Result<(), String> {
+        let options = FormatOptions::new().with_null("null");
+        let names = ArrayFormatter::try_new(batch.column(self.x).as_ref(), &options)
+            .map_err(|e| e.to_string())?;
+        for row in (0..batch.num_rows()).filter(|&row| keys.is_valid(row)) {
+            // Lossless: a place below 2^53.
+            let place = self.shown.xs.len() as f64;
+            self.shown.names.push(named(&names, row));
+            self.shown
+                .push(keys.value(row), place, ys.iter().map(|y| y[row]));
         }
         Ok(())
     }
@@ -261,6 +295,7 @@ impl Rows {
     }
 
     fn append(&mut self, mut other: Rows) {
+        debug_assert!(other.names.is_empty(), "bars go straight in, never waiting");
         self.keys.append(&mut other.keys);
         self.xs.append(&mut other.xs);
         for (column, other) in self.ys.iter_mut().zip(&mut other.ys) {
@@ -270,6 +305,10 @@ impl Rows {
 
     /// Puts the rows in order of `x`; rows of the same `x` keep their order.
     fn sort(&mut self) {
+        debug_assert!(
+            self.names.is_empty(),
+            "bars come in order and are never sorted"
+        );
         let mut order: Vec<usize> = (0..self.xs.len()).collect();
         order.sort_by(|&a, &b| self.xs[a].total_cmp(&self.xs[b]));
         let take = |values: &[f64]| order.iter().map(|&i| values[i]).collect::<Vec<_>>();
@@ -288,14 +327,39 @@ fn axis_kind(data_type: &DataType) -> Option<AxisKind> {
     }
 }
 
-/// What a chart of `x` across and `panes` says above it.
-fn caption(x: &str, panes: &[(usize, String)]) -> String {
+/// Characters of a bar's name kept, at most: no more could show under it.
+const NAME_CHARS: usize = 200;
+
+/// The name of bar `row`, cut to [`NAME_CHARS`].
+fn named(names: &ArrayFormatter<'_>, row: usize) -> Box<str> {
+    let mut name = names.value(row).to_string();
+    if let Some((cut, _)) = name.char_indices().nth(NAME_CHARS) {
+        name.truncate(cut);
+    }
+    name.into_boxed_str()
+}
+
+/// Whether a column of `data_type` names bars: text, or true and false.
+fn is_text(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Boolean => true,
+        DataType::Dictionary(_, values) => is_text(values),
+        _ => false,
+    }
+}
+
+/// What a chart of `x` (across, of `kind`) and `panes` says above it.
+fn caption(x: &str, kind: AxisKind, panes: &[(usize, String)]) -> String {
     let names: Vec<&str> = panes
         .iter()
         .take(MAX_PANES)
         .map(|(_, name)| name.as_str())
         .collect();
-    let mut caption = format!("{x} across; {} below", names.join(", "));
+    let names = names.join(", ");
+    let mut caption = match kind {
+        AxisKind::Category => format!("Bars of {names}, a bar for each {x}"),
+        _ => format!("{x} across; {names} below"),
+    };
     if panes.len() > MAX_PANES {
         let count = panes.len();
         caption.push_str(&format!(
@@ -342,8 +406,19 @@ impl ChartModel for Plotted {
     }
 
     fn x_extent(&self) -> Option<(f64, f64)> {
-        let xs = &self.charted.as_ref()?.shown.xs;
-        Some((*xs.first()?, *xs.last()?))
+        let charted = self.charted.as_ref()?;
+        let xs = &charted.shown.xs;
+        let (first, last) = (*xs.first()?, *xs.last()?);
+        // A bar takes the room up to halfway to its neighbours.
+        match charted.kind {
+            AxisKind::Category => Some((first - 0.5, last + 0.5)),
+            _ => Some((first, last)),
+        }
+    }
+
+    fn x_step(&self) -> Option<f64> {
+        let bars = self.charted.as_ref()?.kind == AxisKind::Category;
+        bars.then_some(1.0)
     }
 
     fn panes(&self) -> usize {
@@ -370,20 +445,41 @@ impl ChartModel for Plotted {
             }
         };
         let (low, high) = found?;
+        // Bars rise from zero, which shows.
+        let (low, high) = match charted.kind {
+            AxisKind::Category => (low.min(0.0), high.max(0.0)),
+            _ => (low, high),
+        };
         Some(Axis::number(low, high).padded(0.08))
     }
 
     fn paint(&self, pane: usize, plot: &Plot, canvas: &mut Canvas<'_>, palette: &ChartPalette) {
         let area = plot.area();
         let (start, end) = (plot.x().start(), plot.x().end());
-        if let Some(mark) = self.mark.filter(|m| (start..=end).contains(m)) {
-            let x = plot.x_px(mark).round();
-            let band = Rect::new(x - 1.0, area.y0, 3.0, area.height());
-            canvas.fill_rect(band, palette.line.with_alpha(0.3));
+        let bars = self.x_kind() == AxisKind::Category;
+        // A bar's place reaches half a place each side of it.
+        let reach = if bars { 0.5 } else { 0.0 };
+        let shown = |m: &f64| m + reach >= start && m - reach <= end;
+        if let Some(mark) = self.mark.filter(shown) {
+            let band = if bars {
+                // Behind a bar: its whole place shows around and above it.
+                let (left, right) = (plot.x_px(mark - 0.5), plot.x_px(mark + 0.5));
+                Rect::from_edges(left.round(), area.y0, right.round(), area.y1)
+            } else {
+                let x = plot.x_px(mark).round();
+                Rect::new(x - 1.0, area.y0, 3.0, area.height())
+            };
+            canvas.fill_rect(band.intersect(area), palette.line.with_alpha(0.3));
         }
         let Some(points) = self.points(pane) else {
             return;
         };
+        if bars {
+            paint_bars(canvas, plot, &points, 1.0, BarStyle::new(), |_| {
+                palette.line
+            });
+            return;
+        }
         let line = LineStyle::new(palette.line).with_width(1.5);
         paint_line(canvas, plot, &points, line);
         let shown = points_within(&points, &plot.x());
@@ -407,6 +503,11 @@ impl ChartModel for Plotted {
             .as_ref()
             .and_then(|c| c.panes.get(pane))
             .map_or("", |(_, name)| name)
+    }
+
+    fn category(&self, index: usize) -> Option<&str> {
+        let names = &self.charted.as_ref()?.shown.names;
+        names.get(index).map(|name| &**name)
     }
 
     fn prepare(&mut self) {

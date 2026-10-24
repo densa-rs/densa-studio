@@ -45,14 +45,17 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   panel runs the query you type with Apache DataFusion and shows the result as it is
   computed; a query sees the files as far as they have loaded. Queries only read.
 - **A chart of the result.** The Chart tab beside the SQL panel puts the result's first
-  column across (a number, date or timestamp) and gives each number column after it a pane
+  column across (a number, date, timestamp or text) and gives each number column after it a pane
   of its own, up to four, named above it:
   `SELECT date_trunc('minute', time) AS minute, count(*), avg(ms) FROM requests GROUP BY 1`
   charts requests and their mean time per minute (no `ORDER BY` needed). It fills as the
   result comes, in order of the first column, and shows all of it until you zoom (wheel) or
   pan (drag), and again once you zoom out to all of it; a few points are drawn as dots.
-  Selecting a row in the result marks it on the chart. A result it cannot chart (text
-  first) says why above it; rows without a value in the first column are left out.
+  Selecting a row in the result marks it on the chart. A first column of text (or
+  true/false) makes a bar chart instead: a bar for each row, in the result's order, named
+  under it, so `SELECT service, count(*), avg(ms) FROM requests GROUP BY 1 ORDER BY 2 DESC`
+  draws requests and mean time per service. A result it cannot chart says why above it; rows
+  without a value in the first column are left out of a line chart.
 - **Live streams.** A `ws://` or `wss://` URL, in the box or on the command line, opens a
   WebSocket stream in a tab that keeps up as rows come. JSON messages are read with the
   columns of the first one (numbers as floats, so a fraction that comes later is never cut

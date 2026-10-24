@@ -4,6 +4,7 @@
 //! time window `time=COLUMN&window=10m` if wanted.
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
@@ -216,13 +217,18 @@ impl FlightSpec {
     }
 
     /// Starts reading, calling `wake` after each event; a read that may pass is tried
-    /// again.
-    fn connect(&self, wake: impl Fn() + Send + 'static) -> Result<FlightStream, String> {
+    /// again. A list of tables comes with their schemas if `schemas`.
+    fn connect(
+        &self,
+        wake: impl Fn() + Send + 'static,
+        schemas: bool,
+    ) -> Result<FlightStream, String> {
         let url = self.url.clone();
         let mut options = match &self.request {
             Request::Sql(query) => FlightOptions::sql(url, query.clone()),
             Request::Path(path) => FlightOptions::path(url, path.clone()),
             Request::Ticket(ticket) => FlightOptions::ticket(url, ticket.as_bytes().to_vec()),
+            Request::Tables if schemas => FlightOptions::sql_tables_with_schemas(url),
             Request::Tables => FlightOptions::sql_tables(url),
         };
         for (name, value) in &self.headers {
@@ -277,6 +283,9 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
+/// Asks for a list of tables again, by their names alone.
+type NamesOnly = Box<dyn FnOnce() -> Result<FlightStream, String>>;
+
 /// A Flight source being read: its rows readied for a table, and how it stands.
 pub(crate) struct Fetch {
     stream: FlightStream,
@@ -286,6 +295,13 @@ pub(crate) struct Fetch {
     done: bool,
     /// Whether a read failed and is being tried again.
     retried: bool,
+    /// Whether the result has started (its columns came).
+    started: bool,
+    /// For a list of tables asked for with their schemas: asking for the names alone, if
+    /// that fails before anything comes.
+    names_only: Option<NamesOnly>,
+    /// Why a list of tables came without their columns, if it did.
+    without_columns: Option<String>,
 }
 
 impl Fetch {
@@ -294,14 +310,42 @@ impl Fetch {
         spec: &FlightSpec,
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self, String> {
+        // Shared with the names-only list of tables that may follow.
+        let wake = Arc::new(Mutex::new(wake));
+        let waker = Arc::clone(&wake);
+        let wake_now = move || {
+            if let Ok(wake) = waker.lock() {
+                wake();
+            }
+        };
+        let names_only = spec.lists_tables().then(|| {
+            let spec = spec.clone();
+            let again: NamesOnly = Box::new(move || {
+                let wake_now = move || {
+                    if let Ok(wake) = wake.lock() {
+                        wake();
+                    }
+                };
+                spec.connect(wake_now, false)
+            });
+            again
+        });
         Ok(Self {
-            stream: spec.connect(wake)?,
+            stream: spec.connect(wake_now, true)?,
             // A Flight result is finite: every row of it is kept.
             keying: Keying::new(spec.key.clone(), None),
             state: "asking".to_owned(),
             done: false,
             retried: false,
+            started: false,
+            names_only,
+            without_columns: None,
         })
+    }
+
+    /// Why a list of tables came without their columns: the service refused to give them.
+    pub(crate) fn without_columns(&self) -> Option<&str> {
+        self.without_columns.as_deref()
     }
 
     /// The key column of the table.
@@ -332,6 +376,7 @@ impl Fetch {
             match self.stream.try_next()? {
                 FlightEvent::Schema(schema) => {
                     // The result starts (over): a table of its columns, numbered from 0.
+                    self.started = true;
                     self.keying.restart();
                     "receiving".clone_into(&mut self.state);
                     let empty = RecordBatch::new_empty(schema);
@@ -358,6 +403,14 @@ impl Fetch {
                     self.state = format!("asking again in {seconds:.1} s ({reason})");
                 }
                 FlightEvent::Failed { reason } => {
+                    // A service may refuse to give its tables' columns: ask for the names.
+                    let names_only = self.names_only.take().filter(|_| !self.started);
+                    if let Some(Ok(stream)) = names_only.map(|again| again()) {
+                        self.stream = stream;
+                        self.without_columns = Some(shortened(&reason));
+                        "asking for the names alone".clone_into(&mut self.state);
+                        continue;
+                    }
                     self.done = true;
                     self.state = format!("failed: {}", shortened(&reason));
                 }
@@ -539,12 +592,21 @@ mod tests {
     }
 
     #[test]
+    fn only_a_list_of_tables_is_asked_again_for_less() {
+        // Nothing listens on port 9: the streams only start trying.
+        let query = FlightSpec::parse("grpc://127.0.0.1:9#sql=SELECT%201").unwrap();
+        assert!(Fetch::connect(&query, || {}).unwrap().names_only.is_none());
+        let tables = FlightSpec::parse("grpc://127.0.0.1:9#tables").unwrap();
+        assert!(Fetch::connect(&tables, || {}).unwrap().names_only.is_some());
+    }
+
+    #[test]
     fn a_header_value_from_the_environment_must_be_set() {
         let spec = FlightSpec::parse(
             "grpc://127.0.0.1:9#sql=SELECT%201&header=authorization:$DENSA_STUDIO_TEST_UNSET",
         )
         .unwrap();
-        let error = spec.connect(|| {}).unwrap_err();
+        let error = spec.connect(|| {}, true).unwrap_err();
         assert_eq!(error, "$DENSA_STUDIO_TEST_UNSET is not set");
     }
 

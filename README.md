@@ -83,8 +83,8 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   SQL. A service that cannot be reached is asked again, with waits that grow; the status bar
   says so, and the first query does not wait for it.
 - **Browsing a Flight SQL server.** `#tables` lists the server's tables (catalog, schema,
-  name and type); Enter or a double click on one opens all its rows in a tab of its own,
-  with the same headers.
+  name and type) with their columns (`id int64, city text, at timestamp`); Enter or a
+  double click on one opens all its rows in a tab of its own, with the same headers.
 - **Headers, without writing secrets down.** Streams and Flight sources take
   `header=NAME:VALUE` after `#`, any number of times; `$NAME` (or `${NAME}`) in a value is
   read from that environment variable when the source opens, so

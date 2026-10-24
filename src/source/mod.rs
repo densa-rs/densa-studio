@@ -16,6 +16,7 @@ use densa_ui::{Ui, WidgetId};
 use densa_widgets::{DataGrid, DockArea, DockAt, DockPanel, Panel};
 
 use crate::flight::{Fetch, FlightSpec};
+use crate::listing;
 use crate::stream::{Arrived, Live, StreamSpec};
 use crate::time::TimeSpec;
 
@@ -308,7 +309,7 @@ impl Source {
                     Some(arrived) => arrived,
                 },
             };
-            let next = self.timed(next);
+            let next = self.timed(self.readable(next));
             match next {
                 Arrived::Columns(columns) => self.start_table(ui, &columns),
                 Arrived::Rows { batch, deleted } => self.upsert(ui, batch, deleted),
@@ -319,6 +320,22 @@ impl Source {
             }
         }
         true
+    }
+
+    /// `arrived` of a list of tables with the schemas sent with it written out (see
+    /// [`listing::readable`]); other sources' as it is.
+    fn readable(&self, arrived: Arrived) -> Arrived {
+        if self.listing.is_none() {
+            return arrived;
+        }
+        match arrived {
+            Arrived::Columns(columns) => Arrived::Columns(listing::readable(columns)),
+            Arrived::Rows { batch, deleted } => Arrived::Rows {
+                batch: listing::readable(batch),
+                deleted,
+            },
+            refused @ Arrived::Refused { .. } => refused,
+        }
     }
 
     /// `arrived` with its time column made timestamps, if the source names one; what went
@@ -464,11 +481,15 @@ impl Source {
             Feed::File { .. } => format!("{}: reading, {rows} rows", self.name),
             Feed::Stream { live, .. } => format!("{}: {}, {rows} rows", self.name, live.status()),
             Feed::Flight { fetch, .. } if self.listing.is_some() => {
-                format!(
+                let mut text = format!(
                     "{}: {}, {rows} tables (Enter opens the selected one)",
                     self.name,
                     fetch.status()
-                )
+                );
+                if let Some(why) = fetch.without_columns() {
+                    text.push_str(&format!("; their columns were refused: {why}"));
+                }
+                text
             }
             Feed::Flight { fetch, .. } => {
                 format!("{}: {}, {rows} rows", self.name, fetch.status())

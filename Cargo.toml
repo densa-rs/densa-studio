@@ -18,6 +18,8 @@ arrow-array = "60"
 arrow-cast = "60"
 # Writing a query's result as CSV, and gathering its rows in the grid's order.
 arrow-csv = { version = "60", default-features = false }
+# Reads the schemas a Flight SQL service sends with its list of tables.
+arrow-ipc = "60"
 arrow-select = "60"
 arrow-schema = "60"
 parquet = { version = "60", default-features = false, features = ["arrow"] }

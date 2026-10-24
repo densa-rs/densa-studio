@@ -327,6 +327,13 @@ mod flights {
             "{status}"
         );
         assert!(source.selected_table(&ui).is_none(), "none selected yet");
+        let (_, batches) = source.snapshot(&ui).unwrap();
+        let columns = batches[0].column_by_name(crate::listing::COLUMNS).unwrap();
+        let columns = arrow_cast::display::array_value_to_string(columns, 0).unwrap();
+        assert!(
+            columns.starts_with("request int64, time timestamp, service text"),
+            "the table's columns, from the schema the service sent: {columns}"
+        );
         // As a paint does before the user can choose a row.
         ui.update::<Grid, _>(source.grid, |grid, cx| {
             densa_grid::GridModel::prepare(grid.model_mut(cx));
@@ -343,6 +350,22 @@ mod flights {
         let (ui, opened) = read(&format!("{url}#sql=SELECT * FROM requests"));
         assert_eq!(opened.rows(&ui), 10);
         assert!(opened.selected_table(&ui).is_none(), "not a list of tables");
+    }
+
+    #[test]
+    fn a_service_that_refuses_its_tables_columns_still_lists_their_names() {
+        let url = samples::flight_server_without_schemas(10).unwrap();
+        let (ui, source) = read(&format!("{url}#tables"));
+        assert_eq!(source.rows(&ui), 1);
+        let status = source.status(&ui);
+        assert!(status.contains("1 tables"), "{status}");
+        assert!(
+            status.contains("their columns were refused: "),
+            "says why there are none: {status}"
+        );
+        let (schema, _) = source.snapshot(&ui).unwrap();
+        assert!(schema.column_with_name(crate::listing::COLUMNS).is_none());
+        assert!(schema.column_with_name("table_name").is_some());
     }
 
     #[test]

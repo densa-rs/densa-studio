@@ -45,7 +45,8 @@ Or from a clone: `cargo run --release -- trips.parquet`.
 - **SQL over everything open.** Each file is a table named after it, in lower case with
   anything but letters and digits made `_` (`Trips 2024.parquet` is `trips_2024`; a name SQL
   reserves gets a `_` after it, so `select.csv` is `select_`, and a name already taken a
-  number, `trips_2`). A `row` column numbers its rows (`row_` if the file has a `row` column). The SQL
+  number, `trips_2`); each tab's title starts with its table's name, as in
+  `trips_2024 · Trips 2024.parquet`. A `row` column numbers its rows (`row_` if the file has a `row` column). The SQL
   panel runs the query you type with Apache DataFusion and shows the result as it is
   computed; a query sees the files as far as they have loaded. Queries only read.
 - **A chart of the result.** The Chart tab beside the SQL panel puts the result's first

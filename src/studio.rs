@@ -661,6 +661,55 @@ mod tests {
     }
 
     #[test]
+    fn each_tab_names_its_table_before_its_file() {
+        let folder =
+            std::env::temp_dir().join(format!("densa-studio-titles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let files: Vec<PathBuf> = ["a", "b"]
+            .iter()
+            .map(|sub| folder.join(sub).join("Trips 2024.csv"))
+            .collect();
+        for file in &files {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x\n1\n").unwrap();
+        }
+        let (mut ui, mut studio) = studio();
+
+        for file in &files {
+            studio.dropped(&mut ui, FileDrop::Dropped(file.clone()));
+        }
+        let dock = ui.widget::<DockArea>(studio.ids.unwrap().dock).unwrap();
+        let titles: Vec<&str> = studio
+            .sources
+            .iter()
+            .map(|s| dock.title(s.panel).unwrap())
+            .collect();
+        // Files of one name are told apart by the names SQL knows them by.
+        assert_eq!(
+            titles,
+            [
+                "trips_2024 · Trips 2024.csv",
+                "trips_2024_2 · Trips 2024.csv"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_tab_says_its_table_name_once() {
+        use crate::source::tab_title;
+        assert_eq!(tab_title("recent", "h:1/readings"), "recent · h:1/readings");
+        // ws://localhost: its table is named after its host, which is all its title has.
+        assert_eq!(tab_title("localhost", "localhost"), "localhost");
+        // A file named as its table, up to its extension: the file's name says it.
+        assert_eq!(tab_title("trips", "trips.parquet"), "trips.parquet");
+        // Only a whole name: `trip` is not the name of `trips.parquet`'s table.
+        assert_eq!(tab_title("trip", "trips.parquet"), "trip · trips.parquet");
+        // The second `trips.csv` open is `trips_2`.
+        assert_eq!(tab_title("trips_2", "trips.csv"), "trips_2 · trips.csv");
+    }
+
+    #[test]
     fn what_is_opened_is_told_by_its_scheme() {
         assert!(matches!(Opening::read("data/a.csv"), Ok(Opening::File(_))));
         assert!(matches!(Opening::read("ws://h/p"), Ok(Opening::Stream(_))));

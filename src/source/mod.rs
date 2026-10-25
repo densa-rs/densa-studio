@@ -200,7 +200,7 @@ impl Source {
             .file_name()
             .map_or_else(|| name.clone(), |f| f.to_string_lossy().into_owned());
         let origin = path.display().to_string();
-        let (panel, grid) = add_tab(ui, dock, table, title, &origin, at)?;
+        let (panel, grid) = add_tab(ui, dock, table, (&name, &title), &origin, at)?;
         let loader = Loader::spawn(reader, wake)?;
         let feed = Feed::File {
             loader,
@@ -225,7 +225,7 @@ impl Source {
         let live = Live::connect(spec, wake)?;
         let table = LiveTable::new(waiting(live.key()), live.key())?;
         let origin = spec.origin();
-        let (panel, grid) = add_tab(ui, dock, table, spec.title(), &origin, at)?;
+        let (panel, grid) = add_tab(ui, dock, table, (&name, &spec.title()), &origin, at)?;
         let feed = Feed::Stream {
             live,
             started: false,
@@ -254,7 +254,7 @@ impl Source {
         let fetch = Fetch::connect(spec, wake)?;
         let table = LiveTable::new(waiting(fetch.key()), fetch.key())?;
         let origin = spec.origin();
-        let (panel, grid) = add_tab(ui, dock, table, spec.title(), &origin, at)?;
+        let (panel, grid) = add_tab(ui, dock, table, (&name, &spec.title()), &origin, at)?;
         let feed = Feed::Flight {
             fetch,
             started: false,
@@ -725,17 +725,31 @@ pub(crate) fn listed(
     Some((text("catalog_name"), text("db_schema_name"), table))
 }
 
-/// Adds a tab titled `title` showing `table` to `dock`, placed `at`, keyed by `origin`.
+/// A source's tab title: the name SQL knows its table by, then `title` (its file, or its
+/// URL's host and what it asks for), so the name stays in view when tabs shrink from the
+/// right; `title` alone when it starts with the name already (`trips.parquet`).
+pub(crate) fn tab_title(name: &str, title: &str) -> String {
+    let says_it = title
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'));
+    match says_it {
+        true => title.to_owned(),
+        false => format!("{name} · {title}"),
+    }
+}
+
+/// Adds a tab showing `table` to `dock`, placed `at`, keyed by `origin`, titled by the
+/// table's SQL name and `title`.
 fn add_tab(
     ui: &mut Ui,
     dock: WidgetId,
     table: LiveTable,
-    title: String,
+    (name, title): (&str, &str),
     origin: &str,
     at: DockAt,
 ) -> Result<(WidgetId, WidgetId), Box<dyn Error>> {
     let model = LiveModel::new(table)?;
-    let spec = DockPanel::new(title).with_key(format!("source:{origin}"));
+    let spec = DockPanel::new(tab_title(name, title)).with_key(format!("source:{origin}"));
     let panel = DockArea::add_panel(ui, dock, Panel::new(), spec, at)?;
     let grid = ui.add(
         panel,

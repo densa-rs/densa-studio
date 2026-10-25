@@ -861,6 +861,7 @@ mod paged {
     }
 
     /// Shows rows `rows` of `source`'s grid, as frames do, until `done` (10 s at most).
+    #[cfg(windows)]
     fn showing_until(
         ui: &mut Ui,
         source: &mut Source,

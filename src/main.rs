@@ -56,6 +56,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         live: args.live,
         light: args.light,
         fresh: args.fresh,
+        paged: args.paged,
         close_at: args
             .seconds
             .map(|s| Instant::now() + Duration::from_secs(s)),

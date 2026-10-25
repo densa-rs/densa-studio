@@ -116,6 +116,22 @@ fn type_name(data_type: &DataType) -> String {
     }
 }
 
+/// The catalog, schema and name of the table in `row` of a list of tables (as Flight SQL
+/// lists them); `None` without a name. Values of any type are read as text.
+pub(crate) fn listed(
+    batch: &RecordBatch,
+    row: usize,
+) -> Option<(Option<String>, Option<String>, String)> {
+    let text = |name: &str| -> Option<String> {
+        let column = batch.column_by_name(name)?.slice(row, 1);
+        let column = arrow_cast::cast(&column, &DataType::Utf8).ok()?;
+        let column = column.as_any().downcast_ref::<arrow_array::StringArray>()?;
+        column.is_valid(0).then(|| column.value(0).to_owned())
+    };
+    let table = text("table_name")?;
+    Some((text("catalog_name"), text("db_schema_name"), table))
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::{BinaryArray, BinaryViewArray, LargeBinaryArray, StringArray};

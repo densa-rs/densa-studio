@@ -19,8 +19,8 @@ fn bars_fill_their_buckets_across() {
     assert_eq!(counts.bars().0, [30.0, 90.0, 210.0], "a bar at each middle");
     assert_eq!(
         counts.x_extent(),
-        Some((0.0, 240.0)),
-        "the whole of each bucket"
+        Some((30.0, 210.0)),
+        "the first and last middles: the chart leaves half a bucket past each"
     );
     assert_eq!(counts.x_step(), Some(60.0));
     assert_eq!(counts.x_kind(), AxisKind::Time);
@@ -212,8 +212,8 @@ fn rows_without_a_time_are_left_out_and_said_to_be() {
     let chart = ui.widget::<CountChart>(counted.chart()).unwrap();
     assert_eq!(
         chart.model().x_extent(),
-        Some((0.0, 2.0)),
-        "only times across"
+        Some((0.5, 1.5)),
+        "only times across: the middles of their buckets"
     );
 }
 

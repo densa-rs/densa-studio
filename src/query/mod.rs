@@ -557,11 +557,19 @@ impl Query {
 fn register(ui: &Ui, engine: &Engine, sources: &mut [Source]) -> Vec<String> {
     let mut skipped = Vec::new();
     for source in sources.iter_mut().filter(|s| s.changed) {
-        let registered = source.snapshot(ui).and_then(|(schema, batches)| {
-            let _ = engine.deregister(&source.name);
-            let registered = engine.register_batches(&source.name, &schema, &batches);
-            registered.map_err(|e| e.to_string())
-        });
+        let registered = match source.paged_file() {
+            // Too large to load: SQL reads the file itself.
+            Some(path) => {
+                let _ = engine.deregister(&source.name);
+                let registered = engine.register_parquet(&source.name, path);
+                registered.map_err(|e| e.to_string())
+            }
+            None => source.snapshot(ui).and_then(|(schema, batches)| {
+                let _ = engine.deregister(&source.name);
+                let registered = engine.register_batches(&source.name, &schema, &batches);
+                registered.map_err(|e| e.to_string())
+            }),
+        };
         source.changed = false;
         if let Err(error) = registered {
             skipped.push(format!("{} is not queryable ({error})", source.name));

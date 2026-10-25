@@ -13,7 +13,7 @@ use densa_window::{App, FileDrop, Host, Waker};
 use crate::config;
 use crate::flight::FlightSpec;
 use crate::query::Query;
-use crate::source::{sql_name, table_name, Source};
+use crate::source::{sql_name, table_name, Source, PAGED_BYTES};
 use crate::stream::{parts, StreamSpec};
 
 /// How often the status bar is written again while something loads.
@@ -57,6 +57,8 @@ pub(crate) struct Start {
     pub(crate) light: bool,
     /// Ignore the arrangement saved last time.
     pub(crate) fresh: bool,
+    /// Read every Parquet file a page at a time, whatever its size.
+    pub(crate) paged: bool,
     pub(crate) close_at: Option<Instant>,
 }
 
@@ -86,7 +88,14 @@ pub(crate) struct Studio {
     status_at: Instant,
     /// When a thread will wake the window for a live query.
     wake_at: Option<Instant>,
+    /// A Parquet file whose rows take more than this many bytes uncompressed is read a page
+    /// at a time, not loaded.
+    paged_from: u64,
 }
+
+/// The memory SQL's queries may hold between them: past it, sorts and aggregates spill to the
+/// temporary folder, and what cannot spill fails, saying so.
+const SQL_MEMORY: usize = 2 << 30;
 
 #[derive(Clone, Copy)]
 struct Ids {
@@ -97,11 +106,15 @@ struct Ids {
 
 impl Studio {
     pub(crate) fn new(start: Start) -> Result<Self, Box<dyn Error>> {
+        // A core left to the window, whatever SQL runs.
+        let cores = std::thread::available_parallelism().map_or(4, usize::from);
+        let engine = Engine::with_threads(cores.saturating_sub(1).max(1))?;
+        let paged_from = if start.paged { 0 } else { PAGED_BYTES };
         Ok(Self {
             query_pending: false,
             first_source: 0,
             start,
-            engine: Engine::new()?,
+            engine: engine.with_memory_limit(SQL_MEMORY)?,
             waker: None,
             ids: None,
             sources: Vec::new(),
@@ -113,6 +126,7 @@ impl Studio {
             problems: Vec::new(),
             status_at: Instant::now(),
             wake_at: None,
+            paged_from,
         })
     }
 
@@ -162,9 +176,15 @@ impl Studio {
                 waker.wake();
             }
         };
-        match what.open(ui, ids.dock, &taken, at, wake) {
+        match what.open(ui, ids.dock, &taken, at, wake, self.paged_from) {
             Ok(source) => {
                 self.note = format!("Opened {} as {}", what.title(), source.name);
+                if source.paged_file().is_some() {
+                    self.note.push_str(
+                        ", a page at a time: too large to load, so its rows come in the \
+                         file's order (sort and filter them with SQL)",
+                    );
+                }
                 let _ = DockArea::show_panel(ui, ids.dock, source.panel);
                 self.sources.push(source);
                 if let Some(welcome) = self.welcome.take() {
@@ -252,11 +272,12 @@ impl Studio {
         let Some(ids) = self.ids else {
             return;
         };
-        // Files still loading, and every stream: how they stand is news.
+        // Files still loading, every stream, and files read a page at a time while their rows
+        // are counted or some could not be read: how they stand is news.
         let loading: Vec<String> = self
             .sources
             .iter()
-            .filter(|s| !s.is_done())
+            .filter(|s| s.tells(ui))
             .map(|s| s.status(ui))
             .collect();
         let text = if !self.hovering.is_empty() {
@@ -529,19 +550,21 @@ impl Opening {
         }
     }
 
-    /// Opens it in a tab of `dock` placed `at`, named apart from `taken`.
+    /// Opens it in a tab of `dock` placed `at`, named apart from `taken`; a Parquet file
+    /// larger than `paged_from` bytes a page at a time.
     fn open(
         &self,
         ui: &mut Ui,
         dock: WidgetId,
         taken: &[String],
         at: DockAt,
-        wake: impl Fn() + Send + 'static,
+        wake: impl Fn() + Send + Sync + 'static,
+        paged_from: u64,
     ) -> Result<Source, Box<dyn Error>> {
         match self {
             Self::File(path) => {
                 let name = table_name(path, taken);
-                Source::open_file(ui, dock, path, name, at, wake)
+                Source::open_file(ui, dock, path, name, at, wake, paged_from)
             }
             Self::Stream(spec) => {
                 let name = sql_name(&spec.name_hint(), taken);
@@ -582,6 +605,7 @@ mod tests {
             live: false,
             light: false,
             fresh: true,
+            paged: false,
             close_at: None,
         };
         let mut studio = Studio::new(start).unwrap();
@@ -590,6 +614,56 @@ mod tests {
         ui.resize(densa_draw::Size::new(1_000.0, 700.0));
         studio.lay_out(&mut ui).unwrap();
         (ui, studio)
+    }
+
+    #[test]
+    fn paged_reads_every_parquet_file_a_page_at_a_time() {
+        let start = |paged| Start {
+            sources: Vec::new(),
+            query: None,
+            live: false,
+            light: false,
+            fresh: true,
+            paged,
+            close_at: None,
+        };
+        assert_eq!(Studio::new(start(true)).unwrap().paged_from, 0);
+        assert_eq!(Studio::new(start(false)).unwrap().paged_from, PAGED_BYTES);
+    }
+
+    #[test]
+    fn a_file_opened_a_page_at_a_time_is_said_to_be() {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+        use parquet::arrow::ArrowWriter;
+
+        let path =
+            std::env::temp_dir().join(format!("densa-studio-{}-note.parquet", std::process::id()));
+        let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..10));
+        let batch = RecordBatch::try_from_iter([("id", ids)]).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let (mut ui, mut studio) = studio();
+        studio.paged_from = 0;
+        studio.open(&mut ui, &path.display().to_string());
+        let note = studio.note.clone();
+        // While its rows are counted, the status bar says how it stands.
+        studio.show_status(&mut ui);
+        let ids = studio.ids.unwrap();
+        let status = ui.widget::<Label>(ids.status).unwrap().text().to_owned();
+        drop(studio);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            note.ends_with(", a page at a time: too large to load, so its rows come in the file's order (sort and filter them with SQL)"),
+            "{note}"
+        );
+        assert!(
+            status.contains(": counting its rows, read a page at a time"),
+            "{status}"
+        );
     }
 
     #[test]

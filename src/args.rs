@@ -13,12 +13,15 @@ pub(crate) struct Args {
     pub(crate) light: bool,
     /// Start with the default arrangement, not the one saved last time.
     pub(crate) fresh: bool,
+    /// Read every Parquet file a page at a time, whatever its size.
+    pub(crate) paged: bool,
     pub(crate) query: Option<String>,
     pub(crate) seconds: Option<u64>,
 }
 
 pub(crate) const USAGE: &str = "usage: densa-studio [FILE, ws:// or grpc:// URL...] [--sample] \
-                                [--query SQL] [--live] [--light] [--fresh] [--seconds N]";
+                                [--query SQL] [--live] [--light] [--fresh] [--paged] \
+                                [--seconds N]";
 
 /// Reads `args` (without the program's name).
 pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
@@ -36,6 +39,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
             "--live" => parsed.live = true,
             "--light" => parsed.light = true,
             "--fresh" => parsed.fresh = true,
+            "--paged" => parsed.paged = true,
             "--query" => {
                 parsed.query = Some(value(at, "--query")?);
                 at += 1;
@@ -71,10 +75,12 @@ mod tests {
             "5",
             "--fresh",
             "--live",
+            "--paged",
         ])
         .unwrap();
         assert_eq!(parsed.sources, ["a.parquet", "ws://h/p#key=id"]);
         assert!(parsed.light && parsed.fresh && parsed.live && !parsed.sample);
+        assert!(parsed.paged);
         assert_eq!(parsed.seconds, Some(5));
     }
 

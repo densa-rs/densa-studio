@@ -1,114 +1,36 @@
 //! A data source: a file read in the background, a live stream, or an Arrow Flight service's
 //! data, into a live table shown in a grid of its own and queryable with SQL by its table
-//! name.
+//! name; or a Parquet file too large to load, read a page at a time as its grid shows it.
+
+mod names;
+mod paged;
 
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::{Array, RecordBatch};
+use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use densa_arrow::LiveModel;
+use densa_arrow::{LiveModel, PagedModel};
 use densa_data::LiveTable;
-use densa_files::{Loader, OpenOptions};
-use densa_ui::{Ui, WidgetId};
+use densa_files::{FileFormat, Loader, OpenOptions};
+use densa_ui::{Ui, Widget, WidgetId};
 use densa_widgets::{DataGrid, DockArea, DockAt, DockPanel, Panel};
 
+pub(crate) use self::names::{grouped, sql_name, tab_title, table_name};
+use self::paged::{Paged, Step};
+pub(crate) use self::paged::{PagedGrid, PAGED_BYTES};
 use crate::counts::Counted;
 use crate::flight::{Fetch, FlightSpec};
 use crate::join::{Joined, Offer, Stepped};
-use crate::listing;
+use crate::listing::{self, listed};
 use crate::stream::{Arrived, Live, StreamSpec};
 use crate::time::TimeSpec;
 
 /// The key column every file gets, numbering its rows as they are read (`row_`, `row__`
 /// and so on when the file has a column of that name).
 const ROW: &str = "row";
-
-/// Words SQL reserves: a table named after one is given a `_` after it, so queries can name
-/// it without quotes.
-const RESERVED: &[&str] = &[
-    "all",
-    "and",
-    "any",
-    "array",
-    "as",
-    "asc",
-    "between",
-    "by",
-    "case",
-    "cast",
-    "check",
-    "column",
-    "create",
-    "cross",
-    "current",
-    "default",
-    "delete",
-    "desc",
-    "distinct",
-    "drop",
-    "else",
-    "end",
-    "except",
-    "exists",
-    "false",
-    "fetch",
-    "filter",
-    "for",
-    "foreign",
-    "from",
-    "full",
-    "group",
-    "having",
-    "in",
-    "inner",
-    "insert",
-    "intersect",
-    "interval",
-    "into",
-    "is",
-    "join",
-    "key",
-    "lateral",
-    "left",
-    "like",
-    "limit",
-    "natural",
-    "not",
-    "null",
-    "offset",
-    "on",
-    "or",
-    "order",
-    "outer",
-    "over",
-    "partition",
-    "primary",
-    "range",
-    "references",
-    "right",
-    "row",
-    "rows",
-    "select",
-    "set",
-    "some",
-    "table",
-    "then",
-    "to",
-    "true",
-    "union",
-    "unique",
-    "update",
-    "user",
-    "using",
-    "values",
-    "when",
-    "where",
-    "window",
-    "with",
-];
 
 pub(crate) type Grid = DataGrid<LiveModel>;
 
@@ -130,6 +52,9 @@ enum Feed {
     /// A Flight service's data, read to its end; its table is made (anew) when its columns
     /// come.
     Flight { fetch: Fetch, started: bool },
+    /// A Parquet file too large to load, read a page at a time as its grid shows them; SQL
+    /// reads the file itself.
+    Paged(Paged),
 }
 
 /// A file loading (or loaded), or a stream, in a live table.
@@ -176,31 +101,36 @@ pub(crate) struct Source {
 
 impl Source {
     /// Opens the file at `path` in a new tab of `dock` placed `at`, named `name` for SQL,
-    /// and starts reading it, calling `wake` as rows arrive. Its tab is keyed by
-    /// its path, so a saved arrangement finds it whatever order sources are opened in.
+    /// and starts reading it, calling `wake` as rows arrive; a Parquet file whose rows take
+    /// more than `paged_from` bytes uncompressed is read a page at a time instead
+    /// ([`PAGED_BYTES`] in the app, or 0 with `--paged`). Its tab is keyed by its path, so a
+    /// saved arrangement finds it whatever order sources are opened in.
     pub(crate) fn open_file(
         ui: &mut Ui,
         dock: WidgetId,
         path: &Path,
         name: String,
         at: DockAt,
-        wake: impl Fn() + Send + 'static,
+        wake: impl Fn() + Send + Sync + 'static,
+        paged_from: u64,
     ) -> Result<Self, Box<dyn Error>> {
         let path = std::fs::canonicalize(path)?;
-        // The file's own columns first, to number rows in a column it does not have.
-        let columns = OpenOptions::new().open(&path)?.schema();
-        let mut key = ROW.to_owned();
-        while columns.column_with_name(&key).is_some() {
-            key.push('_');
+        if FileFormat::from_path(&path) == Some(FileFormat::Parquet) {
+            // Its footer tells how large its rows are.
+            let columns = OpenOptions::new().paged(&path)?;
+            if columns.data_bytes() > paged_from {
+                return Self::open_paged(ui, dock, (path, columns), name, at, Arc::new(wake));
+            }
         }
+        // The file's own columns first, to number rows in a column it does not have.
+        let key = row_key(&OpenOptions::new().open(&path)?.schema());
         let reader = OpenOptions::new().row_numbers(&key).open(&path)?;
         let total = reader.total_rows();
         let table = LiveTable::new(reader.schema(), &key)?;
-        let title = path
-            .file_name()
-            .map_or_else(|| name.clone(), |f| f.to_string_lossy().into_owned());
+        let title = file_title(&path, &name);
         let origin = path.display().to_string();
-        let (panel, grid) = add_tab(ui, dock, table, (&name, &title), &origin, at)?;
+        let grid = Grid::new(LiveModel::new(table)?).with_frozen_columns(1);
+        let (panel, grid) = add_tab(ui, dock, grid, (&name, &title), &origin, at)?;
         let loader = Loader::spawn(reader, wake)?;
         let feed = Feed::File {
             loader,
@@ -210,6 +140,35 @@ impl Source {
             failed: None,
         };
         Ok(Self::new(name, origin, panel, grid, feed))
+    }
+
+    /// Opens the Parquet file at `path` (canonical), whose `columns` are read, as
+    /// [`open_file`](Self::open_file) does, a page at a time: only the rows its grid shows are
+    /// read, numbered from the file's start, in the file's order; SQL reads the file itself.
+    fn open_paged(
+        ui: &mut Ui,
+        dock: WidgetId,
+        (path, columns): (PathBuf, densa_files::FilePages),
+        name: String,
+        at: DockAt,
+        wake: paged::Wake,
+    ) -> Result<Self, Box<dyn Error>> {
+        let title = file_title(&path, &name);
+        let origin = path.display().to_string();
+        let (paged, model) = Paged::open(path, columns, wake)?;
+        let grid = PagedGrid::new(model).with_frozen_columns(1);
+        let (panel, grid) = add_tab(ui, dock, grid, (&name, &title), &origin, at)?;
+        Ok(Self::new(name, origin, panel, grid, Feed::Paged(paged)))
+    }
+
+    /// Shows `model` in place of the file's grid: the file now has other columns. SQL reads
+    /// it anew.
+    fn replace_grid(&mut self, ui: &mut Ui, model: PagedModel) -> Result<(), Box<dyn Error>> {
+        let grid = PagedGrid::new(model).with_frozen_columns(1);
+        let _ = ui.remove(self.grid);
+        self.grid = ui.add(self.panel, grid, Grid::style())?;
+        self.changed = true;
+        Ok(())
     }
 
     /// Opens the stream `spec` in a new tab of `dock` placed `at`, named `name` for SQL, and
@@ -225,7 +184,8 @@ impl Source {
         let live = Live::connect(spec, wake)?;
         let table = LiveTable::new(waiting(live.key()), live.key())?;
         let origin = spec.origin();
-        let (panel, grid) = add_tab(ui, dock, table, (&name, &spec.title()), &origin, at)?;
+        let grid = Grid::new(LiveModel::new(table)?).with_frozen_columns(1);
+        let (panel, grid) = add_tab(ui, dock, grid, (&name, &spec.title()), &origin, at)?;
         let feed = Feed::Stream {
             live,
             started: false,
@@ -254,7 +214,8 @@ impl Source {
         let fetch = Fetch::connect(spec, wake)?;
         let table = LiveTable::new(waiting(fetch.key()), fetch.key())?;
         let origin = spec.origin();
-        let (panel, grid) = add_tab(ui, dock, table, (&name, &spec.title()), &origin, at)?;
+        let grid = Grid::new(LiveModel::new(table)?).with_frozen_columns(1);
+        let (panel, grid) = add_tab(ui, dock, grid, (&name, &spec.title()), &origin, at)?;
         let feed = Feed::Flight {
             fetch,
             started: false,
@@ -295,12 +256,32 @@ impl Source {
     }
 
     /// Whether the source has all its rows: a file or a Flight result read to its end (or
-    /// as far as it could be). A stream never is.
+    /// as far as it could be), or a file read a page at a time (which loads nothing). A
+    /// stream never is.
     pub(crate) fn is_done(&self) -> bool {
         match &self.feed {
             Feed::File { done, .. } => *done,
             Feed::Flight { fetch, .. } => fetch.is_done(),
             Feed::Stream { .. } => false,
+            Feed::Paged(_) => true,
+        }
+    }
+
+    /// Whether how it stands is news for the status bar: a file or a Flight result being
+    /// read, a stream, or a file read a page at a time while its rows are counted or some
+    /// could not be read.
+    pub(crate) fn tells(&self, ui: &Ui) -> bool {
+        match &self.feed {
+            Feed::Paged(paged) => paged.tells(ui, self.grid),
+            _ => !self.is_done(),
+        }
+    }
+
+    /// The file SQL reads itself: one read a page at a time, too large to load.
+    pub(crate) fn paged_file(&self) -> Option<&Path> {
+        match &self.feed {
+            Feed::Paged(paged) => Some(&paged.path),
+            _ => None,
         }
     }
 
@@ -317,8 +298,34 @@ impl Source {
         rows || counts
     }
 
+    /// For a file read a page at a time: takes in what was seen of the file (written to, its
+    /// rows are counted and read again, and SQL reads it anew; with other columns, it is shown
+    /// anew), and asks again for rows that could not be read.
+    fn follow_file(&mut self, ui: &mut Ui) {
+        let Feed::Paged(paged) = &mut self.feed else {
+            return;
+        };
+        let step = paged.step(ui, self.grid);
+        let shown = match step {
+            Ok(Step::Nothing) => Ok(()),
+            Ok(Step::Changed) => {
+                self.changed = true;
+                Ok(())
+            }
+            Ok(Step::Replaced(model)) => self.replace_grid(ui, *model),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = shown {
+            self.refused = Some(format!("the file could not be shown anew: {error}"));
+        }
+    }
+
     /// Takes in the rows read so far, until `deadline`. Whether some are left.
     fn take_rows(&mut self, ui: &mut Ui, deadline: Instant) -> bool {
+        if let Feed::Paged(_) = self.feed {
+            self.follow_file(ui);
+            return false;
+        }
         while Instant::now() < deadline {
             let next = match &mut self.feed {
                 Feed::File {
@@ -349,6 +356,7 @@ impl Source {
                     None => return false,
                     Some(arrived) => arrived,
                 },
+                Feed::Paged { .. } => return false,
             };
             let next = self.timed(self.readable(next));
             match next {
@@ -455,7 +463,7 @@ impl Source {
         let (key, started) = match &mut self.feed {
             Feed::Stream { live, started } => (live.key(), started),
             Feed::Flight { fetch, started } => (fetch.key(), started),
-            Feed::File { .. } => return Ok(()),
+            Feed::File { .. } | Feed::Paged { .. } => return Ok(()),
         };
         if *started {
             return Ok(());
@@ -512,6 +520,7 @@ impl Source {
             key: self.key().to_owned(),
             numbered: self.numbered,
             joined: self.joined.is_some(),
+            paged: matches!(self.feed, Feed::Paged { .. }),
         }
     }
 
@@ -604,7 +613,7 @@ impl Source {
         match &self.feed {
             Feed::File { done, .. } => !done,
             Feed::Flight { fetch, .. } => !fetch.is_done() && !fetch.has_retried(),
-            Feed::Stream { .. } => false,
+            Feed::Stream { .. } | Feed::Paged { .. } => false,
         }
     }
 
@@ -619,8 +628,16 @@ impl Source {
         Some(listing.table(catalog.as_deref(), schema.as_deref(), &table))
     }
 
-    /// The rows taken in so far.
+    /// The rows taken in so far; for a file read a page at a time, the rows it has, once
+    /// counted.
     pub(crate) fn rows(&self, ui: &Ui) -> usize {
+        if let Feed::Paged { .. } = self.feed {
+            let counted = ui.widget::<PagedGrid>(self.grid);
+            let rows = counted
+                .and_then(|grid| grid.model().row_count())
+                .unwrap_or(0);
+            return usize::try_from(rows).unwrap_or(usize::MAX);
+        }
         ui.widget::<Grid>(self.grid)
             .map_or(0, |grid| grid.model().table().len())
     }
@@ -649,6 +666,7 @@ impl Source {
             Feed::Flight { fetch, .. } => {
                 format!("{}: {}, {rows} rows", self.name, fetch.status())
             }
+            Feed::Paged(paged) => paged.status(ui, self.grid, &self.name),
         };
         let mut notes = Vec::new();
         if let Some(off) = &self.time_off {
@@ -693,6 +711,9 @@ impl Source {
         {
             return Err("no rows yet".to_owned());
         }
+        if let Feed::Paged { .. } = self.feed {
+            return Err("it is read a page at a time: SQL reads the file itself".to_owned());
+        }
         let grid = ui.widget::<Grid>(self.grid).ok_or("its tab is gone")?;
         let table = grid.model().table();
         let batches = table.snapshot().map_err(|e| e.to_string())?;
@@ -704,59 +725,43 @@ impl Source {
 fn key_of(feed: &Feed) -> &str {
     match feed {
         Feed::File { key, .. } => key,
+        Feed::Paged(paged) => &paged.key,
         Feed::Stream { live, .. } => live.key(),
         Feed::Flight { fetch, .. } => fetch.key(),
     }
 }
 
-/// The catalog, schema and name of the table in `row` of a list of tables (as Flight SQL
-/// lists them); `None` without a name. Values of any type are read as text.
-pub(crate) fn listed(
-    batch: &RecordBatch,
-    row: usize,
-) -> Option<(Option<String>, Option<String>, String)> {
-    let text = |name: &str| -> Option<String> {
-        let column = batch.column_by_name(name)?.slice(row, 1);
-        let column = arrow_cast::cast(&column, &DataType::Utf8).ok()?;
-        let column = column.as_any().downcast_ref::<arrow_array::StringArray>()?;
-        column.is_valid(0).then(|| column.value(0).to_owned())
-    };
-    let table = text("table_name")?;
-    Some((text("catalog_name"), text("db_schema_name"), table))
-}
-
-/// A source's tab title: the name SQL knows its table by, then `title` (its file, or its
-/// URL's host and what it asks for), so the name stays in view when tabs shrink from the
-/// right; `title` alone when it starts with the name already (`trips.parquet`).
-pub(crate) fn tab_title(name: &str, title: &str) -> String {
-    let says_it = title
-        .strip_prefix(name)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'));
-    match says_it {
-        true => title.to_owned(),
-        false => format!("{name} · {title}"),
-    }
-}
-
-/// Adds a tab showing `table` to `dock`, placed `at`, keyed by `origin`, titled by the
-/// table's SQL name and `title`.
+/// Adds a tab showing `grid` to `dock`, placed `at`, keyed by `origin`, titled by its table's
+/// SQL name and `title`.
 fn add_tab(
     ui: &mut Ui,
     dock: WidgetId,
-    table: LiveTable,
+    grid: impl Widget + 'static,
     (name, title): (&str, &str),
     origin: &str,
     at: DockAt,
 ) -> Result<(WidgetId, WidgetId), Box<dyn Error>> {
-    let model = LiveModel::new(table)?;
     let spec = DockPanel::new(tab_title(name, title)).with_key(format!("source:{origin}"));
     let panel = DockArea::add_panel(ui, dock, Panel::new(), spec, at)?;
-    let grid = ui.add(
-        panel,
-        Grid::new(model).with_frozen_columns(1),
-        Grid::style(),
-    )?;
+    // Every grid is laid out alike, whatever its model.
+    let grid = ui.add(panel, grid, Grid::style())?;
     Ok((panel, grid))
+}
+
+/// The column to number a file's rows in: `row`, or with as many `_` after it as it takes to
+/// be none of the file's `columns`.
+fn row_key(columns: &Schema) -> String {
+    let mut key = ROW.to_owned();
+    while columns.column_with_name(&key).is_some() {
+        key.push('_');
+    }
+    key
+}
+
+/// A file's tab title: its file name, or `name` if it has none.
+fn file_title(path: &Path, name: &str) -> String {
+    path.file_name()
+        .map_or_else(|| name.to_owned(), |f| f.to_string_lossy().into_owned())
 }
 
 /// The tab counting `source`'s rows per bucket of its time column, below its own tab and
@@ -785,54 +790,6 @@ fn counted(
 /// A stream's columns before its first rows: its key alone.
 fn waiting(key: &str) -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(key, DataType::Utf8, true)]))
-}
-
-/// A SQL table name for `path`: its file name without the extension, lower case, with
-/// anything but letters, digits and `_` made `_`, a `_` after a word SQL reserves, and a
-/// number added if `taken` has it.
-pub(crate) fn table_name(path: &Path, taken: &[String]) -> String {
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    sql_name(&stem, taken)
-}
-
-/// A SQL table name from `text`: lower case, with anything but letters, digits and `_` made
-/// `_`, a `_` after a word SQL reserves, and a number added if `taken` has it.
-pub(crate) fn sql_name(text: &str, taken: &[String]) -> String {
-    let mut base: String = text
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    if base.is_empty() {
-        base = "data".to_owned();
-    } else if base.starts_with(|c: char| c.is_ascii_digit()) {
-        base.insert_str(0, "t_");
-    } else if RESERVED.contains(&base.as_str()) {
-        base.push('_');
-    }
-    let mut name = base.clone();
-    let mut n = 2;
-    while taken.contains(&name) {
-        name = format!("{base}_{n}");
-        n += 1;
-    }
-    name
-}
-
-/// `n` with a comma between groups of three digits.
-pub(crate) fn grouped(n: u64) -> String {
-    let digits = n.to_string();
-    let mut text = String::new();
-    for (i, digit) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            text.push(',');
-        }
-        text.push(digit);
-    }
-    text
 }
 
 #[cfg(test)]

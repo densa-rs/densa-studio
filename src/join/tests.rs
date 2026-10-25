@@ -142,6 +142,7 @@ impl Other {
             key: "row".into(),
             numbered: true,
             joined: false,
+            paged: false,
         }
     }
 
@@ -222,6 +223,24 @@ fn joined_to(other: &mut Other, rows: &[(i64, Option<&str>, i64)]) -> (Joined, L
     assert!(step(&mut joined, &mut table, other), "joined at once");
     assert!(joined.join_for(&table).is_some());
     (joined, table)
+}
+
+#[test]
+fn a_table_read_a_page_at_a_time_is_not_joined_and_the_join_says_why() {
+    let mut other = Other::new(&[(0, "north", "N1")]);
+    let mut offer = other.offer();
+    offer.instance = None;
+    offer.paged = true;
+    let mut joined = Joined::new(JoinSpec::parse("site:sites").unwrap());
+    assert!(joined.ready(Some(&offer)).is_none());
+    assert_eq!(
+        joined.describe(),
+        "join off: sites is read a page at a time (too large to load), and Studio joins only \
+         tables it holds: join them in SQL instead"
+    );
+    // Said once: a frame after does not make it anew.
+    assert!(joined.ready(Some(&offer)).is_none());
+    assert!(joined.describe().ends_with("join them in SQL instead"));
 }
 
 #[test]

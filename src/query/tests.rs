@@ -409,6 +409,43 @@ fn rows_refused_in_a_run_again_fail_it_and_it_runs_again() {
 }
 
 #[test]
+fn sql_reads_a_file_read_a_page_at_a_time_itself() {
+    use arrow_array::StringArray;
+    use parquet::arrow::ArrowWriter;
+
+    let name = format!("densa-studio-{}-sql.parquet", std::process::id());
+    let path = std::env::temp_dir().join(name);
+    let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..1_000));
+    let names: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..1_000).map(|i| format!("n{i}")),
+    ));
+    let batch = RecordBatch::try_from_iter([("id", ids), ("name", names)]).unwrap();
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let mut ui = Ui::new(TextSystem::bundled().unwrap());
+    let dock = ui
+        .add(ui.root(), DockArea::new(), DockArea::style())
+        .unwrap();
+    let opened = Source::open_file(&mut ui, dock, &path, "big".into(), DockAt::First, || {}, 0);
+    let engine = Engine::new().unwrap();
+    let mut sources = [opened.unwrap()];
+    let skipped = register(&ui, &engine, &mut sources);
+    let schema = engine.schema("SELECT * FROM big");
+    let _ = std::fs::remove_file(&path);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let schema = schema.unwrap();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(
+        names,
+        ["id", "name"],
+        "the file's own columns: no row numbers"
+    );
+    assert!(!sources[0].changed);
+}
+
+#[test]
 fn sources_sql_cannot_see_are_named_and_not_tried_until_they_change() {
     use densa_datafusion::Engine;
 

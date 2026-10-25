@@ -642,6 +642,290 @@ mod flights {
     }
 }
 
+mod paged {
+    use std::time::Duration;
+
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    use densa_grid::GridModel;
+    use densa_paragraph::TextSystem;
+    use parquet::arrow::ArrowWriter;
+
+    use super::*;
+
+    /// A Parquet file of `rows` ids and names in the temporary folder, removed when dropped.
+    pub(crate) struct ParquetFile(pub(crate) PathBuf);
+
+    impl ParquetFile {
+        pub(crate) fn new(name: &str, rows: i64) -> Self {
+            let name = format!("densa-studio-{}-{name}.parquet", std::process::id());
+            let file = Self(std::env::temp_dir().join(name));
+            write(&file.0, rows);
+            file
+        }
+    }
+
+    impl Drop for ParquetFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn write(path: &Path, rows: i64) {
+        let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..rows));
+        let names = (0..rows).map(|id| format!("n{id}"));
+        let names: ArrayRef = Arc::new(StringArray::from_iter_values(names));
+        let batch = RecordBatch::try_from_iter([("id", ids), ("name", names)]).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// A dock with the file at `path` open in it, read a page at a time if it is larger than
+    /// `paged_from` bytes.
+    fn opened(path: &Path, paged_from: u64) -> (Ui, Source) {
+        let mut ui = Ui::new(TextSystem::bundled().unwrap());
+        let dock = ui
+            .add(ui.root(), DockArea::new(), DockArea::style())
+            .unwrap();
+        let name = "big".to_owned();
+        let source =
+            Source::open_file(&mut ui, dock, path, name, DockAt::First, || {}, paged_from).unwrap();
+        (ui, source)
+    }
+
+    /// Frames as the window makes them (the grid catching up with its model) until `rows`
+    /// rows are counted, 5 s at most.
+    fn frames_until(ui: &mut Ui, source: &mut Source, rows: usize) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while source.rows(ui) != rows && Instant::now() < until {
+            source.take(ui, Instant::now());
+            ui.update::<PagedGrid, _>(source.grid, |grid, cx| grid.model_mut(cx).prepare());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_parquet_file_larger_than_the_limit_is_read_a_page_at_a_time() {
+        let file = ParquetFile::new("paged", 10_000);
+        let (mut ui, mut source) = opened(&file.0, 0);
+        let path = std::fs::canonicalize(&file.0).unwrap();
+        assert_eq!(source.paged_file(), Some(path.as_path()));
+        assert!(source.is_done() && !source.blocks_query() && !source.is_live());
+        assert!(
+            source.status(&ui).starts_with("big: counting its rows"),
+            "{}",
+            source.status(&ui)
+        );
+        frames_until(&mut ui, &mut source, 10_000);
+        assert_eq!(source.rows(&ui), 10_000);
+        let status = source.status(&ui);
+        assert!(
+            status.starts_with("big: 10,000 rows, read a page at a time"),
+            "{status}"
+        );
+        assert!(source.snapshot(&ui).is_err(), "SQL reads the file itself");
+        let grid = ui.widget::<PagedGrid>(source.grid).unwrap();
+        let columns = grid.model().columns();
+        let titles: Vec<&str> = columns.iter().map(|c| &*c.title).collect();
+        assert_eq!(titles, ["id", "name", "row"], "numbered like a file loaded");
+        assert!(source.offer(&ui).paged, "not joined");
+    }
+
+    #[test]
+    fn a_file_within_the_limit_or_not_parquet_still_loads_whole() {
+        let file = ParquetFile::new("whole", 100);
+        // Rows as large as the limit uncompressed, not larger.
+        let bytes = OpenOptions::new().paged(&file.0).unwrap().data_bytes();
+        let (ui, source) = opened(&file.0, bytes);
+        assert_eq!(source.paged_file(), None);
+        assert!(ui.widget::<Grid>(source.grid).is_some());
+        let (ui, source) = opened(&file.0, bytes - 1);
+        assert!(source.paged_file().is_some(), "a byte more than the limit");
+        assert!(ui.widget::<PagedGrid>(source.grid).is_some());
+        let csv = std::env::temp_dir().join(format!("densa-studio-{}-big.csv", std::process::id()));
+        std::fs::write(&csv, "id,name\n1,a\n2,b\n").unwrap();
+        let (ui, source) = opened(&csv, 0);
+        let _ = std::fs::remove_file(&csv);
+        assert_eq!(source.paged_file(), None, "CSV has no index of its rows");
+        assert!(ui.widget::<Grid>(source.grid).is_some());
+    }
+
+    #[test]
+    fn a_file_read_a_page_at_a_time_and_written_to_is_counted_again() {
+        let file = ParquetFile::new("rewritten", 10_000);
+        let (mut ui, mut source) = opened(&file.0, 0);
+        frames_until(&mut ui, &mut source, 10_000);
+        source.changed = false;
+        // Looked at once a second: a file left alone is not read again.
+        let until = Instant::now() + Duration::from_millis(1_300);
+        while Instant::now() < until {
+            source.take(&mut ui, Instant::now());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!source.changed, "unchanged");
+        write(&file.0, 500);
+        frames_until(&mut ui, &mut source, 500);
+        assert_eq!(source.rows(&ui), 500);
+        assert!(source.changed, "SQL reads it anew");
+    }
+
+    /// The titles of the columns `source`'s grid shows.
+    fn titles(ui: &Ui, source: &Source) -> Vec<String> {
+        let grid = ui.widget::<PagedGrid>(source.grid).unwrap();
+        let columns = grid.model().columns();
+        columns.iter().map(|c| c.title.to_string()).collect()
+    }
+
+    #[test]
+    fn a_file_written_with_other_columns_is_shown_anew() {
+        let file = ParquetFile::new("columns", 1_000);
+        let (mut ui, mut source) = opened(&file.0, 0);
+        frames_until(&mut ui, &mut source, 1_000);
+        let first = source.grid;
+        source.changed = false;
+        // Other columns, and one named `row`: the numbers move to `row_`.
+        let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..300));
+        let batch = RecordBatch::try_from_iter([("row", ids)]).unwrap();
+        let writing = std::fs::File::create(&file.0).unwrap();
+        let mut writer = ArrowWriter::try_new(writing, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        frames_until(&mut ui, &mut source, 300);
+        assert_ne!(source.grid, first, "a grid of its own");
+        assert_eq!(titles(&ui, &source), ["row", "row_"]);
+        assert!(source.changed, "SQL reads it anew");
+        assert!(
+            ui.widget::<PagedGrid>(first).is_none(),
+            "the old one is gone"
+        );
+    }
+
+    #[test]
+    fn a_file_gone_is_said_to_be_and_read_again_when_back() {
+        let file = ParquetFile::new("gone", 1_000);
+        let (mut ui, mut source) = opened(&file.0, 0);
+        frames_until(&mut ui, &mut source, 1_000);
+        assert!(!source.tells(&ui), "nothing to tell");
+        std::fs::remove_file(&file.0).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !source.status(&ui).contains("cannot be looked at") && Instant::now() < until {
+            source.take(&mut ui, Instant::now());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = source.status(&ui);
+        assert!(
+            status.contains("; the file cannot be looked at: "),
+            "{status}"
+        );
+        assert!(source.tells(&ui));
+        write(&file.0, 700);
+        frames_until(&mut ui, &mut source, 700);
+        assert_eq!(source.rows(&ui), 700, "{}", source.status(&ui));
+        assert!(!source.status(&ui).contains("cannot be looked at"));
+    }
+
+    #[test]
+    fn a_file_written_to_wakes_the_window_however_idle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let file = ParquetFile::new("wakes", 1_000);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let woken = Arc::clone(&wakes);
+        // Relaxed: a count read on this thread after the waits.
+        let wake = move || {
+            woken.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut ui = Ui::new(TextSystem::bundled().unwrap());
+        let dock = ui
+            .add(ui.root(), DockArea::new(), DockArea::style())
+            .unwrap();
+        let name = "wakes".to_owned();
+        let mut source =
+            Source::open_file(&mut ui, dock, &file.0, name, DockAt::First, wake, 0).unwrap();
+        frames_until(&mut ui, &mut source, 1_000);
+        // No frames from here: only the thread looking at the file can wake the window.
+        std::thread::sleep(Duration::from_millis(1_500));
+        let before = wakes.load(Ordering::Relaxed);
+        write(&file.0, 10);
+        let until = Instant::now() + Duration::from_secs(5);
+        while wakes.load(Ordering::Relaxed) == before && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            wakes.load(Ordering::Relaxed) > before,
+            "woken for the change"
+        );
+        frames_until(&mut ui, &mut source, 10);
+        assert_eq!(source.rows(&ui), 10);
+    }
+
+    /// Shows rows `rows` of `source`'s grid, as frames do, until `done` (10 s at most).
+    fn showing_until(
+        ui: &mut Ui,
+        source: &mut Source,
+        rows: std::ops::Range<usize>,
+        done: impl Fn(&PagedModel) -> bool,
+    ) {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            source.take(ui, Instant::now());
+            ui.update::<PagedGrid, _>(source.grid, |grid, cx| {
+                let model = grid.model_mut(cx);
+                model.prepare();
+                model.showing(rows.clone());
+            });
+            let grid = ui.widget::<PagedGrid>(source.grid).unwrap();
+            if done(grid.model()) || Instant::now() >= until {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A page that could not be read (the file held by another, without changing) is asked
+    /// for again by itself once it can be.
+    #[cfg(windows)]
+    #[test]
+    fn rows_that_could_not_be_read_are_asked_for_again() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let file = ParquetFile::new("held", 10_000);
+        let (mut ui, mut source) = opened(&file.0, 0);
+        frames_until(&mut ui, &mut source, 10_000);
+        // Opened sharing nothing: no one else can open it meanwhile.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file.0)
+            .unwrap();
+        showing_until(&mut ui, &mut source, 9_000..9_020, |m| m.error().is_some());
+        let status = source.status(&ui);
+        assert!(status.contains("asked for again by itself"), "{status}");
+        // Held until the thread looking at the file finds it cannot.
+        let until = Instant::now() + Duration::from_secs(5);
+        while !source.status(&ui).contains("cannot be looked at") && Instant::now() < until {
+            source.take(&mut ui, Instant::now());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = source.status(&ui);
+        assert!(status.contains("cannot be looked at"), "{status}");
+        drop(held);
+        showing_until(&mut ui, &mut source, 9_000..9_020, |m| m.is_fetched(9_000));
+        let grid = ui.widget::<PagedGrid>(source.grid).unwrap();
+        assert!(grid.model().is_fetched(9_000), "{}", source.status(&ui));
+        assert!(grid.model().error().is_none());
+        // Unchanged, but there again: the status bar says no more that it cannot be looked at.
+        let until = Instant::now() + Duration::from_secs(5);
+        while source.status(&ui).contains("cannot be looked at") && Instant::now() < until {
+            source.take(&mut ui, Instant::now());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = source.status(&ui);
+        assert!(!status.contains("cannot be looked at"), "{status}");
+    }
+}
+
 #[test]
 fn counts_are_grouped_by_thousands() {
     assert_eq!(grouped(0), "0");

@@ -7,7 +7,7 @@ use densa_widgets::{DockArea, DockAt};
 
 use super::*;
 use crate::flight::FlightSpec;
-use crate::source::Grid;
+use crate::source::{Grid, PAGED_BYTES};
 use crate::stream::StreamSpec;
 
 /// Where each sample sensor's site is: a file of the sites and their regions (not the
@@ -55,6 +55,7 @@ impl Open {
             name.into(),
             DockAt::First,
             || {},
+            PAGED_BYTES,
         )
         .unwrap();
         self.sources.push(source);

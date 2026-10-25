@@ -350,9 +350,10 @@ impl ChartModel for Counts {
         AxisKind::Time
     }
 
+    /// The first and last buckets' middles: the chart leaves half a bucket of room past
+    /// each, so the bars show whole (edges here would show one bucket as two).
     fn x_extent(&self) -> Option<(f64, f64)> {
-        let half = self.every / 2.0;
-        Some((self.middles.first()? - half, self.middles.last()? + half))
+        Some((*self.middles.first()?, *self.middles.last()?))
     }
 
     fn x_step(&self) -> Option<f64> {

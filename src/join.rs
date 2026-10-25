@@ -82,6 +82,8 @@ pub(crate) struct Offer {
     pub(crate) numbered: bool,
     /// Whether it is joined itself.
     pub(crate) joined: bool,
+    /// Whether it is a file read a page at a time: its rows are not held, so not joined.
+    pub(crate) paged: bool,
 }
 
 /// A source's join to another open table.
@@ -166,6 +168,23 @@ impl Joined {
         let name = &self.spec.table;
         let why = match offer {
             None => format!("no table named {name} is open"),
+            Some(offer) if offer.paged => {
+                // Said once, not made anew each frame.
+                let refused = matches!(
+                    self.state,
+                    State::Off {
+                        reference: None,
+                        ..
+                    }
+                );
+                if !refused && !matches!(self.state, State::On(_)) {
+                    self.refuse(&format!(
+                        "{name} is read a page at a time (too large to load), and Studio joins \
+                         only tables it holds: join them in SQL instead"
+                    ));
+                }
+                return None;
+            }
             Some(offer) => match offer.instance {
                 Some(instance) => return Some((offer, instance)),
                 None => format!("{name} has no rows yet"),

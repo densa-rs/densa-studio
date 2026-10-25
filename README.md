@@ -42,11 +42,19 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   the box at the top or dropped on the window, open in tabs of their own; rows appear while the rest is read. Click a
   column title to sort, drag column edges to resize, select rows with the mouse or keyboard
   and copy them as tab-separated text (Ctrl+C) for a spreadsheet.
+- **Files too large to load, a page at a time.** A Parquet file whose rows take more than
+  1 GB uncompressed (its footer says) is not loaded, nor any Parquet file with `--paged`: it
+  opens at once, and the grid reads only the rows it shows, from anywhere in the file,
+  numbered in its `row` column. Its rows stay in the file's order (a click on a title does
+  not sort them), and SQL reads the file itself: sort, filter and sum it there (queries hold
+  at most 2 GB of memory between them, sorts and sums spilling to the temporary folder past
+  it). A file written to while open is read again; rows that could not be read are asked for
+  again by themselves, and the status bar says why. It cannot be the other table of a join.
 - **SQL over everything open.** Each file is a table named after it, in lower case with
   anything but letters and digits made `_` (`Trips 2024.parquet` is `trips_2024`; a name SQL
   reserves gets a `_` after it, so `select.csv` is `select_`, and a name already taken a
   number, `trips_2`); each tab's title starts with its table's name, as in
-  `trips_2024 · Trips 2024.parquet`. A `row` column numbers its rows (`row_` if the file has a `row` column). The SQL
+  `trips_2024 · Trips 2024.parquet`. A `row` column numbers its rows (`row_` if the file has a `row` column; SQL does not see it for a file read a page at a time). The SQL
   panel runs the query you type with Apache DataFusion and shows the result as it is
   computed; a query sees the files as far as they have loaded. Queries only read.
 - **A chart of the result.** The Chart tab beside the SQL panel puts the result's first
@@ -139,7 +147,8 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   macOS, `$XDG_CONFIG_HOME/densa-studio` or `~/.config/densa-studio` elsewhere.
 
 Options: `--query SQL` runs a query once the files have loaded, `--live` runs it again as
-sources change, `--light` for the light theme, `--seconds N` closes after N seconds.
+sources change, `--paged` reads every Parquet file a page at a time, `--light` for the light
+theme, `--seconds N` closes after N seconds.
 
 ## Next
 

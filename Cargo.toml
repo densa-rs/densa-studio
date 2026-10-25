@@ -25,15 +25,16 @@ arrow-schema = "60"
 parquet = { version = "60", default-features = false, features = ["arrow"] }
 # densa from crates.io; its connectors from their main branch until they are released
 # (Cargo.lock pins the commit).
-densa-arrow = "0.2.4"
-densa-chart = "0.2.4"
-densa-data = "0.2.4"
-densa-draw = "0.2.4"
-densa-ui = "0.2.4"
-densa-widgets = "0.2.4"
-densa-window = "0.2.4"
+densa-arrow = "0.2.5"
+densa-chart = "0.2.5"
+densa-data = "0.2.5"
+densa-draw = "0.2.5"
+densa-ui = "0.2.5"
+densa-widgets = "0.2.5"
+densa-window = "0.2.5"
 densa-datafusion = { git = "https://github.com/densa-rs/densa-connectors" }
-densa-files = { git = "https://github.com/densa-rs/densa-connectors" }
+# `paged`: a Parquet file too large to load, read a page at a time.
+densa-files = { git = "https://github.com/densa-rs/densa-connectors", features = ["paged"] }
 densa-flight = { git = "https://github.com/densa-rs/densa-connectors" }
 densa-ws = { git = "https://github.com/densa-rs/densa-connectors" }
 # The connectors' sample web requests, sensor stream and Flight service, for --sample.
@@ -41,10 +42,10 @@ samples = { git = "https://github.com/densa-rs/densa-connectors", features = ["f
 
 [dev-dependencies]
 # Text without the system's fonts, for tests of the panels.
-densa-paragraph = { version = "0.2.4", default-features = false }
-densa-text = "0.2.4"
+densa-paragraph = { version = "0.2.5", default-features = false }
+densa-text = "0.2.5"
 # The grid's model, prepared as a paint does, for tests that choose rows.
-densa-grid = "0.2.4"
+densa-grid = "0.2.5"
 
 [lints.rust]
 unsafe_code = "forbid"

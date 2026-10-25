@@ -1,11 +1,12 @@
-//! densa studio: open Parquet and CSV files and explore them at once, in grids that fill as
-//! the files load, with SQL over all of them and a chart of the result, in a workspace whose
-//! arrangement is kept between runs.
+//! densa studio: open Parquet and CSV files, WebSocket streams and Arrow Flight services and
+//! explore them at once, in grids that keep up as rows come, with SQL over all of them and a
+//! chart of the result, in a workspace whose arrangement is kept between runs.
 //!
-//! `densa-studio [FILE or ws://URL...]`, `--sample` to open a million sample web requests and
-//! a local stream of sensor readings joined to their sites, `--query SQL` to run once the files have loaded, `--live`
-//! to run it again each second while sources change, `--light` for the light theme, `--fresh`
-//! to ignore the saved arrangement, `--seconds N` to close after N seconds.
+//! `densa-studio [FILE, ws:// or grpc:// URL...]`, `--sample` to open sample web requests,
+//! sites, sensor streams (one joined to the sites) and a Flight service's tables, `--query SQL`
+//! to run once the files have loaded, `--live` to run it again each second while sources
+//! change, `--light` for the light theme, `--fresh` to ignore the saved arrangement,
+//! `--seconds N` to close after N seconds. How to use it: <https://densa.dev/studio/>.
 
 mod args;
 mod chart;

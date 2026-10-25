@@ -14,6 +14,8 @@ of live data, and on its [connectors](https://github.com/densa-rs/densa-connecto
 > from crates.io, and densa's connectors from their main branch (pinned in `Cargo.lock`)
 > until they are released.
 
+How to use it, with every option: [densa.dev/studio](https://densa.dev/studio/).
+
 ## Install and run
 
 You need Rust 1.94 or later and a GPU with Vulkan, Metal, DirectX 12 or OpenGL.
@@ -28,7 +30,8 @@ densa-studio --sample        # a million sample web requests (written to your ca
                              # their `time` column as timestamps, and a local Flight SQL
                              # service's list of tables
 densa-studio "wss://example.com/trades#key=id"
-densa-studio "grpc+tls://flight.example.com:443#sql=SELECT * FROM trips&header=authorization:Bearer $TOKEN"
+# in single quotes, so the shell leaves $TOKEN for Studio to read from the environment
+densa-studio 'grpc+tls://flight.example.com:443#sql=SELECT * FROM trips&header=authorization:Bearer $TOKEN'
 ```
 
 Or from a clone: `cargo run --release -- trips.parquet`.
@@ -41,8 +44,8 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   and copy them as tab-separated text (Ctrl+C) for a spreadsheet.
 - **SQL over everything open.** Each file is a table named after it, in lower case with
   anything but letters and digits made `_` (`Trips 2024.parquet` is `trips_2024`; a name SQL
-  reserves gets a `_` after it, so `select.csv` is `select_`); the status bar shows each
-  name. A `row` column numbers its rows (`row_` if the file has a `row` column). The SQL
+  reserves gets a `_` after it, so `select.csv` is `select_`, and a name already taken a
+  number, `trips_2`). A `row` column numbers its rows (`row_` if the file has a `row` column). The SQL
   panel runs the query you type with Apache DataFusion and shows the result as it is
   computed; a query sees the files as far as they have loaded. Queries only read.
 - **A chart of the result.** The Chart tab beside the SQL panel puts the result's first
@@ -66,13 +69,15 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   connection opens (percent-encoded: `%7B` for `{`, `%23` for `#`), `#arrow` reads Arrow
   IPC instead of JSON, and `#name=TABLE` names its table for SQL, joined with `&`. The status bar shows each stream's connection, rows
   per second and messages skipped; a lost connection is opened again.
-- **Times as times.** Streams and Flight sources take `time=COLUMN` after `#`: that column
-  becomes UTC timestamps as rows arrive, so the grid shows `2026-10-24 01:23:45.119Z`, SQL
+- **Times as times.** Streams and Flight sources take `time=COLUMN` after `#`: that column,
+  of numbers or text, becomes UTC timestamps as rows arrive (one of timestamps or dates stays
+  as it is), so the grid shows `2026-10-24 01:23:45.119Z`, SQL
   works on it directly (`date_trunc('minute', time)`) and charts put it on a time axis.
   Numbers are read as milliseconds since 1970, as JSON feeds mostly send them, unless
   `unit=s` (or `ms`, `us`, `ns`) says otherwise; text is read as ISO 8601
-  (`2026-10-24T01:23:45Z`, to the millisecond). A column that is not there, or values that
-  cannot be read, are named in the status bar; the rows come all the same.
+  (`2026-10-24T01:23:45Z`, to the millisecond). A column that is not there is named in the
+  status bar, and values that cannot be read become nulls, counted there; the rows come all
+  the same.
 - **Time windows.** With `window=10m` beside `time=COLUMN`, only the rows within ten minutes
   of the newest are kept, older ones leaving as new ones come (`500ms`, `30s`, `10m`, `2h`
   and `1d` are spans too). The window follows the data's own times, not the clock. The
@@ -95,10 +100,10 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   row of the other table that arrives or changes (a file still loading, a stream of
   reference data) updates every row naming it at once; rows that leave it (a window, a row
   replaced by one naming another key) leave the joined rows within a second. Rows naming
-  nothing show empty columns. A column name both tables have gets the other table's name in
+  nothing get nulls in those columns. A column name both tables have gets the other table's name in
   front (`sites_name`), and the row numbers Studio gives a file are left out. The other
-  table can be a file, a stream or a Flight result, opened before or after; it cannot have
-  a `join=` of its own. Its rows without a value in that column name nothing; when several
+  table can be a file, a stream or a Flight result, opened before or after; it cannot be
+  the source itself or have a `join=` of its own. Its rows without a value in that column name nothing; when several
   rows hold one value, the last to arrive is the one joined. A Flight result read again is
   joined anew, even with other columns; if it can no longer be joined (its column is gone),
   the source shows its own columns again. The status bar says what each source is joined
@@ -127,18 +132,17 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   second while its sources change: its result is updated in place (the selected row and the
   sort stay) and the chart moves with it.
 - **A workspace that stays as you left it.** Tabs and panels can be dragged to other groups
-  or split beside them, and the arrangement is restored next time (`--fresh` starts from the
-  default one). It is saved in your configuration folder: `%APPDATA%\densa-studio` on
-  Windows, `~/Library/Application Support/densa-studio` on macOS, `~/.config/densa-studio`
-  elsewhere.
+  or split beside them, and the arrangement is restored the next time the same files and URLs
+  open (`--fresh` starts from the default one). It is saved in your configuration folder:
+  `%APPDATA%\densa-studio` on Windows, `~/Library/Application Support/densa-studio` on
+  macOS, `$XDG_CONFIG_HOME/densa-studio` or `~/.config/densa-studio` elsewhere.
 
 Options: `--query SQL` runs a query once the files have loaded, `--live` runs it again as
 sources change, `--light` for the light theme, `--seconds N` closes after N seconds.
 
 ## Next
 
-A listed table's columns before opening it; bar charts of text categories and picking the
-charted columns without SQL.
+Picking the charted columns without SQL.
 
 ## License
 

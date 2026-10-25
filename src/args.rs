@@ -17,7 +17,7 @@ pub(crate) struct Args {
     pub(crate) seconds: Option<u64>,
 }
 
-pub(crate) const USAGE: &str = "usage: densa-studio [FILE or ws://URL...] [--sample] \
+pub(crate) const USAGE: &str = "usage: densa-studio [FILE, ws:// or grpc:// URL...] [--sample] \
                                 [--query SQL] [--live] [--light] [--fresh] [--seconds N]";
 
 /// Reads `args` (without the program's name).

@@ -4,7 +4,7 @@ description = "Open Parquet, CSV and live data and explore it at once: grids, SQ
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-homepage = "https://densa.dev"
+homepage = "https://densa.dev/studio/"
 repository = "https://github.com/densa-rs/densa-studio"
 readme = "README.md"
 # DataFusion 55's minimum.

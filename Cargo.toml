@@ -32,7 +32,7 @@ densa-draw = "0.2.5"
 densa-ui = "0.2.5"
 densa-widgets = "0.2.5"
 densa-window = "0.2.5"
-densa-datafusion = { git = "https://github.com/densa-rs/densa-connectors" }
+densa-datafusion = { git = "https://github.com/densa-rs/densa-connectors", features = ["paged"] }
 # `paged`: a Parquet file too large to load, read a page at a time.
 densa-files = { git = "https://github.com/densa-rs/densa-connectors", features = ["paged"] }
 densa-flight = { git = "https://github.com/densa-rs/densa-connectors" }

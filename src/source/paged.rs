@@ -1,6 +1,7 @@
-//! A Parquet file too large to load, read a page at a time: its grid's model, a thread that
-//! looks at the file for changes (off the window's thread, which a slow disk or share would
-//! hold up), and rows that could not be read asked for again.
+//! A Parquet file too large to load, read a page at a time: its grid's model (sorted by a
+//! click on a title, by copies of the file sorted once for each column), a thread that looks at
+//! the file for changes (off the window's thread, which a slow disk or share would hold up), and
+//! rows that could not be read asked for again.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use densa_arrow::{FetchError, PagedModel};
+use densa_datafusion::{Engine, Sorts};
 use densa_files::{FileError, FilePages, OpenOptions};
 use densa_ui::{Ui, WidgetId};
 use densa_widgets::DataGrid;
@@ -34,6 +36,14 @@ const RETRY_MOST: Duration = Duration::from_secs(60);
 
 /// A wake for the window, for any thread.
 pub(crate) type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// How files are read a page at a time: those whose rows take more than `from` bytes
+/// uncompressed ([`PAGED_BYTES`], or 0 with `--paged`), sorted by copies `engine` makes.
+#[derive(Clone, Copy)]
+pub(crate) struct Paging<'a> {
+    pub(crate) from: u64,
+    pub(crate) engine: &'a Engine,
+}
 
 /// What the thread looking at the file saw.
 enum Seen {
@@ -60,6 +70,9 @@ pub(crate) struct Paged {
     /// The column numbering its rows.
     pub(crate) key: String,
     wake: Wake,
+    /// Makes its sorted copies, and what they are doing.
+    engine: Engine,
+    sorts: Sorts,
     seen: Receiver<Seen>,
     /// Dropped with the source: the thread looking at the file then ends.
     _stop: Sender<()>,
@@ -77,15 +90,17 @@ pub(crate) struct Paged {
 
 impl Paged {
     /// The file at `path` (canonical), whose `columns` are read (without row numbers): the
-    /// model of its pages, and the source watching it, waking the window with `wake`.
+    /// model of its pages, sorted by copies `engine` makes, and the source watching it, waking
+    /// the window with `wake`.
     pub(crate) fn open(
         path: PathBuf,
         columns: FilePages,
         wake: Wake,
+        engine: &Engine,
     ) -> Result<(Self, PagedModel), Box<dyn Error>> {
         let key = row_key(&columns.schema());
         let pages = OpenOptions::new().row_numbers(&key).paged(&path)?;
-        let model = PagedModel::new(pages.schema(), pages, waking(&wake))?;
+        let (model, sorts) = sortable(engine, pages, &wake)?;
         let (sender, seen) = mpsc::channel();
         let (stop, stopped) = mpsc::channel();
         let ticking = Arc::new(AtomicBool::new(false));
@@ -105,6 +120,8 @@ impl Paged {
             path,
             key,
             wake,
+            engine: engine.clone(),
+            sorts,
             seen,
             _stop: stop,
             ticking,
@@ -119,6 +136,15 @@ impl Paged {
     /// Takes in what the thread looking at the file saw, and asks again for rows that could not
     /// be read, once their wait is over. `grid` is the file's grid.
     pub(crate) fn step(&mut self, ui: &mut Ui, grid: WidgetId) -> Result<Step, Box<dyn Error>> {
+        // A sorted copy the grid no longer shows is given up.
+        if let Some(grid) = ui.widget::<PagedGrid>(grid) {
+            let schema = grid.model().schema();
+            let column = grid
+                .sort_order()
+                .and_then(|(at, _)| schema.fields().get(at));
+            self.sorts
+                .showing(column.map(|field| field.name().as_str()));
+        }
         let mut step = Step::Nothing;
         while let Ok(seen) = self.seen.try_recv() {
             match seen {
@@ -133,7 +159,8 @@ impl Paged {
                 Seen::Replaced(pages, key) => {
                     self.trouble = None;
                     self.key = key;
-                    let model = PagedModel::new(pages.schema(), pages, waking(&self.wake))?;
+                    let (model, sorts) = sortable(&self.engine, pages, &self.wake)?;
+                    self.sorts = sorts;
                     step = Step::Replaced(Box::new(model));
                 }
                 Seen::Trouble(why) => self.trouble = Some(why),
@@ -187,11 +214,12 @@ impl Paged {
         self.retry_at = None;
     }
 
-    /// Whether how it stands is news for the status bar: its rows being counted, rows that
-    /// could not be read, or a file that cannot be looked at.
+    /// Whether how it stands is news for the status bar: its rows being counted or sorted,
+    /// rows that could not be read, or a file that cannot be looked at.
     pub(crate) fn tells(&self, ui: &Ui, grid: WidgetId) -> bool {
         let model = ui.widget::<PagedGrid>(grid).map(DataGrid::model);
         self.trouble.is_some()
+            || self.sorts.making().is_some()
             || model.is_some_and(|model| model.row_count().is_none() || model.error().is_some())
     }
 
@@ -205,10 +233,18 @@ impl Paged {
             Some(rows) => format!("{} rows", grouped(rows)),
             None => "counting its rows".to_owned(),
         };
-        let mut text = format!(
-            "{name}: {rows}, read a page at a time (too large to load: sort and filter it with \
-             SQL)"
-        );
+        let mut text = match self.sorts.making() {
+            Some(sorting) => format!(
+                "{name}: {rows}, sorting by {}: {} s so far (the first sort by a column makes a \
+                 sorted copy of the file; its pages are then as quick as the file's)",
+                sorting.column(),
+                sorting.since().elapsed().as_secs()
+            ),
+            None => format!(
+                "{name}: {rows}, read a page at a time (too large to load: a click on a title \
+                 sorts it, by a sorted copy of the file; filter it with SQL)"
+            ),
+        };
         if let Some(error) = model.error() {
             text.push_str(&format!("; {}", missing(error)));
         }
@@ -231,10 +267,23 @@ fn missing(error: &FetchError) -> String {
     }
 }
 
-/// A wake for the model's thread.
-fn waking(wake: &Wake) -> impl Fn() + Send + 'static {
+/// A wake for the model's thread, or the engine's.
+fn waking(wake: &Wake) -> impl Fn() + Send + Sync + 'static {
     let wake = Arc::clone(wake);
     move || wake()
+}
+
+/// The model of `pages`, sorted by copies `engine` makes, waking the window with `wake` as rows
+/// arrive and while a copy is made; and what its sorts are doing.
+fn sortable(
+    engine: &Engine,
+    pages: FilePages,
+    wake: &Wake,
+) -> Result<(PagedModel, Sorts), Box<dyn Error>> {
+    let pages = engine.sortable(pages)?.with_wake(waking(wake));
+    let sorts = pages.sorts();
+    let model = PagedModel::new(pages.schema(), pages, waking(wake))?;
+    Ok((model, sorts))
 }
 
 /// The thread looking at the file.

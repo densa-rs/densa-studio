@@ -646,7 +646,8 @@ mod paged {
     use std::time::Duration;
 
     use arrow_array::{ArrayRef, Int64Array, StringArray};
-    use densa_grid::GridModel;
+    use densa_datafusion::Engine;
+    use densa_grid::{CellText, GridModel, Palette, SortOrder};
     use densa_paragraph::TextSystem;
     use parquet::arrow::ArrowWriter;
 
@@ -689,8 +690,13 @@ mod paged {
             .add(ui.root(), DockArea::new(), DockArea::style())
             .unwrap();
         let name = "big".to_owned();
+        let engine = Engine::with_threads(2).unwrap();
+        let paging = Paging {
+            from: paged_from,
+            engine: &engine,
+        };
         let source =
-            Source::open_file(&mut ui, dock, path, name, DockAt::First, || {}, paged_from).unwrap();
+            Source::open_file(&mut ui, dock, path, name, DockAt::First, || {}, paging).unwrap();
         (ui, source)
     }
 
@@ -841,8 +847,13 @@ mod paged {
             .add(ui.root(), DockArea::new(), DockArea::style())
             .unwrap();
         let name = "wakes".to_owned();
+        let engine = Engine::with_threads(2).unwrap();
+        let paging = Paging {
+            from: 0,
+            engine: &engine,
+        };
         let mut source =
-            Source::open_file(&mut ui, dock, &file.0, name, DockAt::First, wake, 0).unwrap();
+            Source::open_file(&mut ui, dock, &file.0, name, DockAt::First, wake, paging).unwrap();
         frames_until(&mut ui, &mut source, 1_000);
         // No frames from here: only the thread looking at the file can wake the window.
         std::thread::sleep(Duration::from_millis(1_500));
@@ -860,8 +871,55 @@ mod paged {
         assert_eq!(source.rows(&ui), 10);
     }
 
+    /// The text of cell (`row`, `column`) of `source`'s grid.
+    fn cell(ui: &Ui, source: &Source, row: usize, column: usize) -> String {
+        let grid = ui.widget::<PagedGrid>(source.grid).unwrap();
+        let mut text = CellText::new();
+        grid.model().cell(row, column, &mut text, &Palette::new());
+        text.as_str().to_owned()
+    }
+
+    /// Sorts `source`'s grid by `column`, as a click on its title does.
+    fn sort(ui: &mut Ui, source: &Source, column: usize, order: SortOrder) {
+        ui.update::<PagedGrid, _>(source.grid, |grid, cx| {
+            assert!(grid.model_mut(cx).sort(column, order));
+        });
+    }
+
+    #[test]
+    fn a_click_on_a_title_sorts_a_file_read_a_page_at_a_time() {
+        // Large enough that its sorted copy takes a while to make.
+        let file = ParquetFile::new("sorted", 1_500_000);
+        let (mut ui, mut source) = opened(&file.0, 0);
+        frames_until(&mut ui, &mut source, 1_500_000);
+        sort(&mut ui, &source, 0, SortOrder::Descending);
+        // Frames as the window makes them, the status bar read each time.
+        let (mut told, until) = (false, Instant::now() + Duration::from_secs(30));
+        while cell(&ui, &source, 0, 0) != "1499999" && Instant::now() < until {
+            source.take(&mut ui, Instant::now());
+            ui.update::<PagedGrid, _>(source.grid, |grid, cx| {
+                let model = grid.model_mut(cx);
+                model.prepare();
+                model.showing(0..20);
+            });
+            told |= source.status(&ui).contains("sorting by id: ");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(cell(&ui, &source, 0, 0), "1499999", "largest first");
+        assert_eq!(
+            cell(&ui, &source, 0, 2),
+            "1499999",
+            "its row number from the file"
+        );
+        assert!(told, "the status bar told the sort while its copy was made");
+        assert!(!source.tells(&ui), "sorted: nothing to tell");
+        // The row numbers' title gives back the file's order.
+        sort(&mut ui, &source, 2, SortOrder::Ascending);
+        showing_until(&mut ui, &mut source, 0..20, |model| model.is_fetched(0));
+        assert_eq!(cell(&ui, &source, 0, 0), "0");
+    }
+
     /// Shows rows `rows` of `source`'s grid, as frames do, until `done` (10 s at most).
-    #[cfg(windows)]
     fn showing_until(
         ui: &mut Ui,
         source: &mut Source,

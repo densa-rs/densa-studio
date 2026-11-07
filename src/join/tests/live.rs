@@ -7,7 +7,7 @@ use densa_widgets::{DockArea, DockAt};
 
 use super::*;
 use crate::flight::FlightSpec;
-use crate::source::{Grid, PAGED_BYTES};
+use crate::source::{Grid, Paging, PAGED_BYTES};
 use crate::stream::StreamSpec;
 
 /// Where each sample sensor's site is: a file of the sites and their regions (not the
@@ -48,6 +48,12 @@ impl Open {
     fn file(&mut self, name: &str, text: &str) {
         let path = self.folder.join(format!("{name}.csv"));
         std::fs::write(&path, text).unwrap();
+        // A small CSV file is loaded: the engine sorts only files read a page at a time.
+        let engine = densa_datafusion::Engine::with_threads(1).unwrap();
+        let paging = Paging {
+            from: PAGED_BYTES,
+            engine: &engine,
+        };
         let source = Source::open_file(
             &mut self.ui,
             self.dock,
@@ -55,7 +61,7 @@ impl Open {
             name.into(),
             DockAt::First,
             || {},
-            PAGED_BYTES,
+            paging,
         )
         .unwrap();
         self.sources.push(source);

@@ -413,6 +413,8 @@ fn sql_reads_a_file_read_a_page_at_a_time_itself() {
     use arrow_array::StringArray;
     use parquet::arrow::ArrowWriter;
 
+    use crate::source::Paging;
+
     let name = format!("densa-studio-{}-sql.parquet", std::process::id());
     let path = std::env::temp_dir().join(name);
     let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..1_000));
@@ -428,8 +430,20 @@ fn sql_reads_a_file_read_a_page_at_a_time_itself() {
     let dock = ui
         .add(ui.root(), DockArea::new(), DockArea::style())
         .unwrap();
-    let opened = Source::open_file(&mut ui, dock, &path, "big".into(), DockAt::First, || {}, 0);
     let engine = Engine::new().unwrap();
+    let paging = Paging {
+        from: 0,
+        engine: &engine,
+    };
+    let opened = Source::open_file(
+        &mut ui,
+        dock,
+        &path,
+        "big".into(),
+        DockAt::First,
+        || {},
+        paging,
+    );
     let mut sources = [opened.unwrap()];
     let skipped = register(&ui, &engine, &mut sources);
     let schema = engine.schema("SELECT * FROM big");

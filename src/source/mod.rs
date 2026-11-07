@@ -20,7 +20,7 @@ use densa_widgets::{DataGrid, DockArea, DockAt, DockPanel, Panel};
 
 pub(crate) use self::names::{grouped, sql_name, tab_title, table_name};
 use self::paged::{Paged, Step};
-pub(crate) use self::paged::{PagedGrid, PAGED_BYTES};
+pub(crate) use self::paged::{PagedGrid, Paging, PAGED_BYTES};
 use crate::counts::Counted;
 use crate::flight::{Fetch, FlightSpec};
 use crate::join::{Joined, Offer, Stepped};
@@ -102,9 +102,8 @@ pub(crate) struct Source {
 impl Source {
     /// Opens the file at `path` in a new tab of `dock` placed `at`, named `name` for SQL,
     /// and starts reading it, calling `wake` as rows arrive; a Parquet file whose rows take
-    /// more than `paged_from` bytes uncompressed is read a page at a time instead
-    /// ([`PAGED_BYTES`] in the app, or 0 with `--paged`). Its tab is keyed by its path, so a
-    /// saved arrangement finds it whatever order sources are opened in.
+    /// more bytes uncompressed than `paging` says is read a page at a time instead. Its tab is
+    /// keyed by its path, so a saved arrangement finds it whatever order sources are opened in.
     pub(crate) fn open_file(
         ui: &mut Ui,
         dock: WidgetId,
@@ -112,14 +111,15 @@ impl Source {
         name: String,
         at: DockAt,
         wake: impl Fn() + Send + Sync + 'static,
-        paged_from: u64,
+        paging: Paging<'_>,
     ) -> Result<Self, Box<dyn Error>> {
         let path = std::fs::canonicalize(path)?;
         if FileFormat::from_path(&path) == Some(FileFormat::Parquet) {
             // Its footer tells how large its rows are.
             let columns = OpenOptions::new().paged(&path)?;
-            if columns.data_bytes() > paged_from {
-                return Self::open_paged(ui, dock, (path, columns), name, at, Arc::new(wake));
+            if columns.data_bytes() > paging.from {
+                let (wake, engine) = (Arc::new(wake), paging.engine);
+                return Self::open_paged(ui, dock, (path, columns), name, at, (wake, engine));
             }
         }
         // The file's own columns first, to number rows in a column it does not have.
@@ -144,18 +144,19 @@ impl Source {
 
     /// Opens the Parquet file at `path` (canonical), whose `columns` are read, as
     /// [`open_file`](Self::open_file) does, a page at a time: only the rows its grid shows are
-    /// read, numbered from the file's start, in the file's order; SQL reads the file itself.
+    /// read, numbered from the file's start, in the file's order or sorted by copies `engine`
+    /// makes; SQL reads the file itself.
     fn open_paged(
         ui: &mut Ui,
         dock: WidgetId,
         (path, columns): (PathBuf, densa_files::FilePages),
         name: String,
         at: DockAt,
-        wake: paged::Wake,
+        (wake, engine): (paged::Wake, &densa_datafusion::Engine),
     ) -> Result<Self, Box<dyn Error>> {
         let title = file_title(&path, &name);
         let origin = path.display().to_string();
-        let (paged, model) = Paged::open(path, columns, wake)?;
+        let (paged, model) = Paged::open(path, columns, wake, engine)?;
         let grid = PagedGrid::new(model).with_frozen_columns(1);
         let (panel, grid) = add_tab(ui, dock, grid, (&name, &title), &origin, at)?;
         Ok(Self::new(name, origin, panel, grid, Feed::Paged(paged)))

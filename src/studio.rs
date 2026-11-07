@@ -13,7 +13,7 @@ use densa_window::{App, FileDrop, Host, Waker};
 use crate::config;
 use crate::flight::FlightSpec;
 use crate::query::Query;
-use crate::source::{sql_name, table_name, Source, PAGED_BYTES};
+use crate::source::{sql_name, table_name, Paging, Source, PAGED_BYTES};
 use crate::stream::{parts, StreamSpec};
 
 /// How often the status bar is written again while something loads.
@@ -176,13 +176,17 @@ impl Studio {
                 waker.wake();
             }
         };
-        match what.open(ui, ids.dock, &taken, at, wake, self.paged_from) {
+        let paging = Paging {
+            from: self.paged_from,
+            engine: &self.engine,
+        };
+        match what.open(ui, ids.dock, &taken, at, wake, paging) {
             Ok(source) => {
                 self.note = format!("Opened {} as {}", what.title(), source.name);
                 if source.paged_file().is_some() {
                     self.note.push_str(
-                        ", a page at a time: too large to load, so its rows come in the \
-                         file's order (sort and filter them with SQL)",
+                        ", a page at a time: too large to load (a click on a title sorts it; \
+                         the first sort by a column makes a sorted copy of the file)",
                     );
                 }
                 let _ = DockArea::show_panel(ui, ids.dock, source.panel);
@@ -551,7 +555,7 @@ impl Opening {
     }
 
     /// Opens it in a tab of `dock` placed `at`, named apart from `taken`; a Parquet file
-    /// larger than `paged_from` bytes a page at a time.
+    /// larger than `paging` says a page at a time.
     fn open(
         &self,
         ui: &mut Ui,
@@ -559,12 +563,12 @@ impl Opening {
         taken: &[String],
         at: DockAt,
         wake: impl Fn() + Send + Sync + 'static,
-        paged_from: u64,
+        paging: Paging<'_>,
     ) -> Result<Source, Box<dyn Error>> {
         match self {
             Self::File(path) => {
                 let name = table_name(path, taken);
-                Source::open_file(ui, dock, path, name, at, wake, paged_from)
+                Source::open_file(ui, dock, path, name, at, wake, paging)
             }
             Self::Stream(spec) => {
                 let name = sql_name(&spec.name_hint(), taken);
@@ -657,7 +661,7 @@ mod tests {
         drop(studio);
         let _ = std::fs::remove_file(&path);
         assert!(
-            note.ends_with(", a page at a time: too large to load, so its rows come in the file's order (sort and filter them with SQL)"),
+            note.ends_with(", a page at a time: too large to load (a click on a title sorts it; the first sort by a column makes a sorted copy of the file)"),
             "{note}"
         );
         assert!(

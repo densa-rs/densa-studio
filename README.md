@@ -45,11 +45,14 @@ Or from a clone: `cargo run --release -- trips.parquet`.
 - **Files too large to load, a page at a time.** A Parquet file whose rows take more than
   1 GB uncompressed (its footer says) is not loaded, nor any Parquet file with `--paged`: it
   opens at once, and the grid reads only the rows it shows, from anywhere in the file,
-  numbered in its `row` column. Its rows stay in the file's order (a click on a title does
-  not sort them), and SQL reads the file itself: sort, filter and sum it there (queries hold
-  at most 2 GB of memory between them, sorts and sums spilling to the temporary folder past
-  it). A file written to while open is read again; rows that could not be read are asked for
-  again by themselves, and the status bar says why. It cannot be the other table of a join.
+  numbered in its `row` column. A click on a title sorts it: the first sort by a column makes
+  a copy of the file sorted by it, in the temporary folder, which takes a while for a large
+  file (the status bar counts the seconds; clicking another title meanwhile gives it up), and
+  its pages then come as quickly as the file's, either way round; the `row` title gives back
+  the file's order. SQL reads the file itself: filter and sum it there (queries and sorts hold
+  at most 2 GB of memory between them, spilling to the temporary folder past it). A file
+  written to while open is read again; rows that could not be read are asked for again by
+  themselves, and the status bar says why. It cannot be the other table of a join.
 - **SQL over everything open.** Each file is a table named after it, in lower case with
   anything but letters and digits made `_` (`Trips 2024.parquet` is `trips_2024`; a name SQL
   reserves gets a `_` after it, so `select.csv` is `select_`, and a name already taken a

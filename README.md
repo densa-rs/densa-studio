@@ -66,7 +66,8 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   `SELECT date_trunc('minute', time) AS minute, count(*), avg(ms) FROM requests GROUP BY 1`
   charts requests and their mean time per minute (no `ORDER BY` needed). It fills as the
   result comes, in order of the first column, and shows all of it until you zoom (wheel) or
-  pan (drag), and again once you zoom out to all of it; a few points are drawn as dots.
+  pan (drag), and again once you zoom out to all of it; a few points are drawn as dots, and a
+  line of millions of rows costs a frame about the chart's width, not its rows.
   Selecting a row in the result marks it on the chart. A first column of text (or
   true/false) makes a bar chart instead: a bar for each row, in the result's order, named
   under it, so `SELECT service, count(*), avg(ms) FROM requests GROUP BY 1 ORDER BY 2 DESC`

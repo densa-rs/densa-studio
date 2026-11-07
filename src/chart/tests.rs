@@ -313,6 +313,25 @@ fn the_y_extent_is_found_again_when_rows_or_the_view_change() {
 }
 
 #[test]
+fn a_row_sorted_in_among_the_first_counts_in_the_y_extent() {
+    // 100 rows, the last ones at one `x`: a row sorted in among the first leaves the last
+    // summarized one where it was, so only knowing that rows moved makes the summary anew.
+    let xs: Vec<i64> = (0..=96).chain([96, 96, 96]).collect();
+    let rows = batch(0, vec![("x", ints(&xs)), ("y", ints(&[0; 100]))]);
+    let mut chart = Plotted::new(&rows.schema(), "#");
+    chart.add(&rows).unwrap();
+    let wide = Axis::number(0.0, 100.0);
+    assert!(chart.y_axis(0, &wide).unwrap().end() < 100.0);
+    // Kept up: a summary of other points draws and measures as well, visiting every one.
+    assert_eq!(chart.summary(0).unwrap().len(), 100);
+    let late = batch(100, vec![("x", floats(&[10.5])), ("y", ints(&[1000]))]);
+    chart.add(&late).unwrap();
+    chart.finish();
+    assert!(chart.y_axis(0, &wide).unwrap().end() > 1000.0);
+    assert_eq!(chart.summary(0).unwrap().len(), 101);
+}
+
+#[test]
 fn rows_for_a_chart_that_shows_nothing_are_ignored() {
     let bytes: ArrayRef = Arc::new(BinaryArray::from_vec(vec![b"a"]));
     let rows = batch(0, vec![("blob", bytes), ("n", ints(&[1]))]);

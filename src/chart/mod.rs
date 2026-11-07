@@ -3,10 +3,10 @@
 //! order the rows come in. A first column of text (or true/false) makes a bar chart
 //! instead: a bar for each row, in the result's order, named by that column.
 //!
-//! Each column is read into plain numbers once, as its rows arrive: a chart reads every point
-//! in sight each frame, and slices of numbers are the cheapest thing to read them from.
+//! Each column is read into plain numbers once, as its rows arrive, and summarized
+//! (`LineSummary`): a frame then costs about the chart's width however many rows show.
 
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::time::{Duration, Instant};
 
 use arrow_array::cast::AsArray;
@@ -16,8 +16,8 @@ use arrow_cast::cast;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use densa_chart::{
-    paint_bars, paint_line, points_within, y_extent, Axis, AxisKind, BarStyle, ChartModel,
-    ChartPalette, LineStyle, Plot, Points, Rect,
+    paint_bars, paint_line_summarized, points_within, Axis, AxisKind, BarStyle, ChartModel,
+    ChartPalette, LineStyle, LineSummary, Plot, Points, Rect,
 };
 use densa_draw::Canvas;
 
@@ -58,18 +58,12 @@ struct Charted {
     /// Rows that came out of order, until they are sorted in.
     waiting: Rows,
     sorted_at: Instant,
-    /// Each pane's last `y` extent, for the `x` and rows it was found for: finding it reads
-    /// every point in sight, and a chart is often repainted without moving (the pointer
-    /// moving over it).
-    extents: RefCell<Vec<Option<Extent>>>,
-}
-
-/// A pane's `y` extent while `x` shows, of the first `rows` rows.
-#[derive(Clone, Copy)]
-struct Extent {
-    x: (f64, f64),
-    rows: usize,
-    found: Option<(f64, f64)>,
+    /// Counts the times rows were sorted in: rows moved, so summaries made before are not of
+    /// them (a summary takes in rows added after those it holds, not rows moved among them).
+    order: u64,
+    /// Each pane's summary of its points, and the `order` it was made at; brought up to date
+    /// when the chart is drawn.
+    summaries: RefCell<Vec<(u64, LineSummary)>>,
 }
 
 /// Rows as numbers: each row's key, `x`, and a value per pane; and for bars, each one's
@@ -162,6 +156,26 @@ impl Plotted {
         let shown = &self.charted.as_ref()?.shown;
         Some((&shown.xs, shown.ys.get(pane)?))
     }
+
+    /// Pane `pane`'s summary of its points, brought up to date: rows added since are taken
+    /// in, and after rows were sorted in it is made anew.
+    fn summary(&self, pane: usize) -> Option<Ref<'_, LineSummary>> {
+        let charted = self.charted.as_ref()?;
+        let points = self.points(pane)?;
+        {
+            let mut summaries = charted.summaries.borrow_mut();
+            let (order, summary) = summaries.get_mut(pane)?;
+            if *order == charted.order {
+                summary.update(&points);
+            } else {
+                summary.rebuild(&points);
+                *order = charted.order;
+            }
+        }
+        Some(Ref::map(charted.summaries.borrow(), |summaries| {
+            &summaries[pane].1
+        }))
+    }
 }
 
 impl Charted {
@@ -205,7 +219,8 @@ impl Charted {
             shown: empty(),
             waiting: empty(),
             sorted_at: Instant::now(),
-            extents: RefCell::new(vec![None; panes.len()]),
+            order: 0,
+            summaries: RefCell::new(vec![(0, LineSummary::new()); panes.len()]),
             panes,
         };
         Ok((charted, caption))
@@ -281,6 +296,7 @@ impl Charted {
         self.waiting.ys = vec![Vec::new(); self.panes.len()];
         self.shown.append(waiting);
         self.shown.sort();
+        self.order += 1;
         self.sorted_at = Instant::now();
     }
 }
@@ -428,23 +444,8 @@ impl ChartModel for Plotted {
     fn y_axis(&self, pane: usize, x: &Axis) -> Option<Axis> {
         let charted = self.charted.as_ref()?;
         let points = self.points(pane)?;
-        let mut extents = charted.extents.borrow_mut();
-        let last = extents.get_mut(pane)?;
-        let (shown, rows) = ((x.start(), x.end()), points.len());
-        let found = match *last {
-            // Rows only arrive or move into place, and the count changes with either.
-            Some(extent) if extent.x == shown && extent.rows == rows => extent.found,
-            _ => {
-                let found = y_extent(&points, points_within(&points, x));
-                *last = Some(Extent {
-                    x: shown,
-                    rows,
-                    found,
-                });
-                found
-            }
-        };
-        let (low, high) = found?;
+        let summary = self.summary(pane)?;
+        let (low, high) = summary.y_extent(&points, points_within(&points, x))?;
         // Bars rise from zero, which shows.
         let (low, high) = match charted.kind {
             AxisKind::Category => (low.min(0.0), high.max(0.0)),
@@ -480,8 +481,11 @@ impl ChartModel for Plotted {
             });
             return;
         }
+        let Some(summary) = self.summary(pane) else {
+            return;
+        };
         let line = LineStyle::new(palette.line).with_width(1.5);
-        paint_line(canvas, plot, &points, line);
+        paint_line_summarized(canvas, plot, &points, &summary, line);
         let shown = points_within(&points, &plot.x());
         if shown.len() > DOTS_UP_TO {
             return;

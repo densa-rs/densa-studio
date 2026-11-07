@@ -116,11 +116,22 @@ Or from a clone: `cargo run --release -- trips.parquet`.
   nothing get nulls in those columns. A column name both tables have gets the other table's name in
   front (`sites_name`), and the row numbers Studio gives a file are left out. The other
   table can be a file, a stream or a Flight result, opened before or after; it cannot be
-  the source itself or have a `join=` of its own. Its rows without a value in that column name nothing; when several
+  the source itself or have a `join=` or `pairs=` of its own. Its rows without a value in that column name nothing; when several
   rows hold one value, the last to arrive is the one joined. A Flight result read again is
   joined anew, even with other columns; if it can no longer be joined (its column is gone),
   the source shows its own columns again. The status bar says what each source is joined
   with, or why it is not. SQL, the window and the counts see the joined rows.
+- **Pairs, live.** `pairs=COLUMN:TABLE` (or `pairs=COLUMN:TABLE.OTHER`) shows each of a
+  stream's or Flight source's rows with every row of another open table holding the same
+  value, once per row, and once with empty columns when none does:
+  `ws://host/orders#key=order&pairs=customer:addresses` shows each order with each address
+  of its customer. Both sides stay current as for lookups, and a numbered source's rows too
+  old to keep leave every pair they are in. The rows are keyed by a `pair` column (it names
+  the two rows, for SQL); the other table's key column is kept unless it is the one paired
+  on (for a file, its row numbers). A value held by m rows here and n there makes m × n
+  rows, so pair on a column that tells rows apart; SQL and `per=` counts see the pairs, one
+  row each. A source takes one of `join=` and `pairs=`, and `window=` does not go with
+  `pairs=` yet (the rows a window let go of would stay held for their pairs).
 - **Arrow Flight.** A `grpc://` or `grpc+tls://` URL opens a Flight service's data in a tab
   that fills as it arrives. After `#`, say what to ask for: `sql=QUERY` (a Flight SQL
   server), `path=A/B` (a dataset by its path) or `ticket=T`. `key=COLUMN` keeps the latest

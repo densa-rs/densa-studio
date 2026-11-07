@@ -243,6 +243,40 @@ fn a_stream_joined_to_another_stream_follows_its_changes() {
 }
 
 #[test]
+fn a_stream_paired_with_a_file_shows_each_reading_with_every_note_of_its_site() {
+    let mut open = Open::new("pairs");
+    open.file("notes", "site,note\nnorth,gate\nnorth,mast\nsouth,pier\n");
+    open.stream("key=sensor&pairs=site:notes");
+    open.until(|open| open.pairs(1, "note").len() >= 400);
+    let notes = open.pairs(1, "note");
+    assert!(notes.len() >= 400, "{}", open.sources[1].status(&open.ui));
+    let count = |site: &str, note: Option<&str>| {
+        let note = note.map(str::to_owned);
+        notes
+            .iter()
+            .filter(|(s, n)| s == site && *n == note)
+            .count()
+    };
+    // Every north reading twice, once with each note; other sites' readings alone.
+    assert!(count("north", Some("gate")) > 0);
+    assert_eq!(count("north", Some("gate")), count("north", Some("mast")));
+    assert_eq!(count("north", None), 0);
+    assert!(count("south", Some("pier")) > 0);
+    for (site, note) in &notes {
+        if site != "north" && site != "south" {
+            assert_eq!(*note, None, "{site}");
+        }
+    }
+    let columns = open.columns(1);
+    assert_eq!(columns[columns.len() - 3..], ["note", "row", "pair"]);
+    let status = open.sources[1].status(&open.ui);
+    assert!(
+        status.contains("(paired with rows of notes on site)"),
+        "{status}"
+    );
+}
+
+#[test]
 fn a_stream_cannot_be_joined_to_itself() {
     let mut open = Open::new("itself");
     open.stream("key=sensor&name=readings&join=site:readings");

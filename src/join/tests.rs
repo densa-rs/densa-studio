@@ -13,6 +13,7 @@ fn a_join_names_a_column_and_the_table_it_looks_up() {
             column: "site".into(),
             table: "sites".into(),
             key: "site".into(),
+            pairs: false,
         },
         "the table's column of the same name"
     );
@@ -21,9 +22,14 @@ fn a_join_names_a_column_and_the_table_it_looks_up() {
     assert_eq!(spec.option(), "join=place:sites.site");
     let spaced = JoinSpec::parse("a b:t").unwrap();
     assert_eq!(spaced.option(), "join=a%20b:t.a%20b");
+    let pairs = JoinSpec::pairs("customer:addresses.owner").unwrap();
+    assert!(pairs.pairs);
+    assert_eq!(pairs.option(), "pairs=customer:addresses.owner");
     for bad in ["site", ":sites", "site:", "site:sites.", "site:.site"] {
         let error = JoinSpec::parse(bad).unwrap_err();
         assert!(error.contains("join=COLUMN:TABLE"), "{bad}: {error}");
+        let error = JoinSpec::pairs(bad).unwrap_err();
+        assert!(error.contains("pairs=COLUMN:TABLE"), "{bad}: {error}");
     }
 }
 
@@ -37,7 +43,16 @@ fn remote_sources_take_one_join_and_are_known_by_it() {
     assert_eq!(stream.origin(), "ws://h/r#key=sensor&join=site:sites.site");
     let twice = StreamSpec::parse("ws://h/r#join=a:t&join=b:t").unwrap_err();
     assert!(twice.contains("twice"), "{twice}");
+    let both = StreamSpec::parse("ws://h/r#join=a:t&pairs=b:t").unwrap_err();
+    assert!(both.contains("twice"), "{both}");
+    let paired = StreamSpec::parse("ws://h/r#key=order&pairs=customer:addresses.owner").unwrap();
+    assert_eq!(
+        paired.origin(),
+        "ws://h/r#key=order&pairs=customer:addresses.owner"
+    );
     let empty = StreamSpec::parse("ws://h/r#join").unwrap_err();
+    assert!(empty.contains("needs a value"), "{empty}");
+    let empty = StreamSpec::parse("ws://h/r#pairs").unwrap_err();
     assert!(empty.contains("needs a value"), "{empty}");
     let unknown = StreamSpec::parse("ws://h/r#jion=a:t").unwrap_err();
     assert!(unknown.contains("join=COLUMN:TABLE"), "{unknown}");
@@ -51,6 +66,10 @@ fn remote_sources_take_one_join_and_are_known_by_it() {
     );
     let twice = FlightSpec::parse("grpc://h#path=a&join=a:t&join=b:t").unwrap_err();
     assert!(twice.contains("twice"), "{twice}");
+    let paired = FlightSpec::parse("grpc://h#path=a&pairs=site:sites").unwrap();
+    assert!(paired.join.as_ref().is_some_and(|join| join.pairs));
+    let both = FlightSpec::parse("grpc://h#path=a&pairs=a:t&join=b:t").unwrap_err();
+    assert!(both.contains("twice"), "{both}");
     let unknown = FlightSpec::parse("grpc://h#path=a&jion=a:t").unwrap_err();
     assert!(unknown.contains("join=COLUMN:TABLE"), "{unknown}");
 }
@@ -637,3 +656,4 @@ fn rows_may_name_a_file_row_by_its_number() {
 }
 
 mod live;
+mod pairs;

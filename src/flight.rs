@@ -10,7 +10,7 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use densa_flight::{FlightEvent, FlightOptions, FlightStream};
 
-use crate::join::JoinSpec;
+use crate::join::{check_window, JoinSpec};
 use crate::stream::{
     encode, header, header_value, option_text, options, parts, shortened, Arrived, Keying,
 };
@@ -130,6 +130,7 @@ impl FlightSpec {
             return Err("path= names a dataset: path=A/B".to_owned());
         }
         spec.time = time.finish(spec.key.as_deref())?;
+        check_window(spec.join.as_ref(), spec.time.as_ref())?;
         Ok(spec)
     }
 
@@ -147,9 +148,13 @@ impl FlightSpec {
             "ticket" => Request::Ticket(value),
             "key" => return once(&mut self.key, option, value).map(|()| None),
             "name" => return once(&mut self.name, option, value).map(|()| None),
-            "join" if self.join.is_some() => return Err("join= is given twice".to_owned()),
+            "join" | "pairs" if self.join.is_some() => return Err(JoinSpec::TWICE.to_owned()),
             "join" => {
                 self.join = Some(JoinSpec::parse(&value)?);
+                return Ok(None);
+            }
+            "pairs" => {
+                self.join = Some(JoinSpec::pairs(&value)?);
                 return Ok(None);
             }
             "header" => {
@@ -508,7 +513,7 @@ mod tests {
         let error = FlightSpec::parse("grpc://h#path=a&later=1").unwrap_err();
         assert!(
             error.ends_with(
-                "name=TABLE, join=COLUMN:TABLE, time=COLUMN, unit=s, window=10m and per=1m"
+                "name=TABLE, join=COLUMN:TABLE, pairs=COLUMN:TABLE, time=COLUMN, unit=s, window=10m and per=1m"
             ),
             "{error}"
         );

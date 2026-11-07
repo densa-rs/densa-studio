@@ -184,8 +184,9 @@ fn a_time_column_is_part_of_what_a_stream_is_known_by() {
     assert!(error.contains("time=COLUMN"), "{error}");
     let error = StreamSpec::parse("ws://h/p#later").unwrap_err();
     assert!(
-        error
-            .ends_with("name=TABLE, join=COLUMN:TABLE, time=COLUMN, unit=s, window=10m and per=1m"),
+        error.ends_with(
+            "join=COLUMN:TABLE, pairs=COLUMN:TABLE, time=COLUMN, unit=s, window=10m and per=1m"
+        ),
         "{error}"
     );
 }

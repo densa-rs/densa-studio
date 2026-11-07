@@ -23,7 +23,7 @@ use self::paged::{Paged, Step};
 pub(crate) use self::paged::{PagedGrid, Paging, PAGED_BYTES};
 use crate::counts::Counted;
 use crate::flight::{Fetch, FlightSpec};
-use crate::join::{Joined, Offer, Stepped};
+use crate::join::{delete_rows, Joined, Offer, Stepped};
 use crate::listing::{self, listed};
 use crate::stream::{Arrived, Live, StreamSpec};
 use crate::time::TimeSpec;
@@ -80,7 +80,7 @@ pub(crate) struct Source {
     pub(crate) counts: Option<Counted>,
     /// For a list of a Flight SQL service's tables: what was asked, to ask for a table.
     listing: Option<FlightSpec>,
-    /// Its join to another open table: for a remote source that says `join=`.
+    /// Its join to another open table: for a remote source that says `join=` or `pairs=`.
     pub(crate) joined: Option<Joined>,
     /// Studio numbers its rows (it has no key of its own).
     numbered: bool,
@@ -426,21 +426,23 @@ impl Source {
         // Kept for the sources joined to this one, if it takes them.
         let copy = self.watched.then(|| batch.clone());
         let joined = &mut self.joined;
-        let (mut taken, mut gone) = (None, 0);
+        let (mut taken, mut removed) = (None, None);
         ui.update::<Grid, _>(self.grid, |grid, cx| {
             let table = grid.model_mut(cx).table_mut();
             taken = Some(match joined.as_mut().and_then(|j| j.join_for(table)) {
                 Some(join) => join.upsert_left(table, batch),
                 None => table.upsert(batch),
             });
-            // Numbered rows too old to keep go even when these rows were refused: their
-            // numbers are never offered again.
+            // Numbered rows too old to keep go even when these rows were refused (their
+            // numbers are never offered again), through the join if one is made.
             if let Some(deleted) = deleted {
-                gone = table.delete(&deleted).map_or(0, |changes| changes.deleted);
+                removed = Some(delete_rows(joined.as_mut(), table, &deleted));
             }
         });
-        if gone > 0 {
-            self.deletions += 1;
+        match removed {
+            Some(Ok(changes)) if changes.deleted > 0 => self.deletions += 1,
+            Some(Err(error)) => self.refused = Some(format!("old rows stay: {error}")),
+            _ => {}
         }
         match taken {
             Some(Ok(changes)) => {

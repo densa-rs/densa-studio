@@ -13,7 +13,7 @@ use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use densa_ws::{Stream, StreamEvent, StreamOptions};
 
-use crate::join::JoinSpec;
+use crate::join::{check_window, JoinSpec};
 use crate::time::{TimeOptions, TimeSpec};
 
 /// The column that numbers a stream's rows when it has no key (`row_`, `row__` and so on
@@ -100,12 +100,15 @@ impl StreamSpec {
                 ("key", false) => spec.key = Some(value),
                 ("name", false) if spec.name.is_some() => return Err("name= is given twice".into()),
                 ("name", false) => spec.name = Some(value),
-                ("join", false) if spec.join.is_some() => return Err("join= is given twice".into()),
+                ("join" | "pairs", false) if spec.join.is_some() => {
+                    return Err(JoinSpec::TWICE.into())
+                }
                 ("join", false) => spec.join = Some(JoinSpec::parse(&value)?),
+                ("pairs", false) => spec.join = Some(JoinSpec::pairs(&value)?),
                 ("subscribe", false) => spec.subscribe.push(value),
                 ("header", false) => spec.headers.push(header(&value)?),
                 ("arrow", true) => spec.arrow = true,
-                ("key" | "subscribe" | "header" | "name" | "join", true) => {
+                ("key" | "subscribe" | "header" | "name" | "join" | "pairs", true) => {
                     return Err(format!("{name} needs a value"))
                 }
                 _ => {
@@ -120,6 +123,7 @@ impl StreamSpec {
             }
         }
         spec.time = time.finish(spec.key.as_deref())?;
+        check_window(spec.join.as_ref(), spec.time.as_ref())?;
         Ok(spec)
     }
 

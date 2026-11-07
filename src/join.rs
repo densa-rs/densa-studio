@@ -1,7 +1,10 @@
-//! Lookup joins: a remote source's rows shown with the columns of the row of another open
-//! table that each one names, `join=COLUMN:TABLE` after `#` (the table's column of the same
-//! name) or `join=COLUMN:TABLE.KEY`, kept as either side changes. The joined rows are the
-//! source's table: its grid, its window, its counts and SQL all see them.
+//! Joins of a remote source's rows to another open table, kept as either side changes:
+//! lookups, `join=COLUMN:TABLE` after `#` (the table's column of the same name) or
+//! `join=COLUMN:TABLE.KEY`, show each row with the columns of the row it names; pairs,
+//! `pairs=COLUMN:TABLE` or `pairs=COLUMN:TABLE.OTHER`, show each row once with every row of
+//! the table holding the same value (once with empty columns if none does), in a table keyed
+//! by a `pair` column. The joined rows are the source's table: its grid, its window, its
+//! counts and SQL all see them.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -9,11 +12,12 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use densa_data::{Changes, DataError, LiveTable, LookupJoin};
+use densa_data::{Changes, DataError, LiveTable, LookupJoin, PairJoin};
 use densa_ui::Ui;
 
 use crate::source::Source;
 use crate::stream::encode;
+use crate::time::TimeSpec;
 
 /// How often, at most, the joined rows are checked for rows that left the other table:
 /// the check reads all of it.
@@ -21,49 +25,197 @@ const PRUNE_EVERY: Duration = Duration::from_secs(1);
 /// What a join waits for first.
 const OWN_ROWS: &str = "waiting for this source's rows";
 
-/// What `join=` says: which column names rows of which table, by which of its columns.
+/// What `join=` or `pairs=` says: which column is matched with which table, by which of its
+/// columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JoinSpec {
-    /// The source's column naming the other table's rows.
+    /// The source's column naming (or holding the values of) the other table's rows.
     pub(crate) column: String,
     /// The other table, by the name SQL knows it by.
     pub(crate) table: String,
-    /// Its column the names are looked up in.
+    /// Its column `column`'s values are matched with: looked up in, or paired by.
     pub(crate) key: String,
+    /// Whether each row is paired with every row holding its value (`pairs=`), not with the
+    /// one row it names (`join=`).
+    pub(crate) pairs: bool,
 }
 
 impl JoinSpec {
-    /// The option, for messages about unknown ones.
-    pub(crate) const KNOWN: &'static str = "join=COLUMN:TABLE";
+    /// The options, for messages about unknown ones.
+    pub(crate) const KNOWN: &'static str = "join=COLUMN:TABLE, pairs=COLUMN:TABLE";
+    /// What a source given two joins is told.
+    pub(crate) const TWICE: &'static str =
+        "join= or pairs= is given twice: a source is joined to one table, by one of them";
 
-    /// Reads `COLUMN:TABLE` or `COLUMN:TABLE.KEY` (table names have no dots).
+    /// Reads `join=`'s `COLUMN:TABLE` or `COLUMN:TABLE.KEY` (table names have no dots).
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        let usage = || {
+        Self::read(value, false).ok_or_else(|| {
             "join= names a column and the open table its values name rows of: \
              join=COLUMN:TABLE, or join=COLUMN:TABLE.KEY when that table's column has \
              another name"
                 .to_owned()
-        };
-        let (column, table) = value.split_once(':').ok_or_else(usage)?;
+        })
+    }
+
+    /// Reads `pairs=`'s `COLUMN:TABLE` or `COLUMN:TABLE.OTHER`.
+    pub(crate) fn pairs(value: &str) -> Result<Self, String> {
+        Self::read(value, true).ok_or_else(|| {
+            "pairs= names a column and the open table whose rows holding the same value each \
+             row is shown with: pairs=COLUMN:TABLE, or pairs=COLUMN:TABLE.OTHER when that \
+             table's column has another name"
+                .to_owned()
+        })
+    }
+
+    fn read(value: &str, pairs: bool) -> Option<Self> {
+        let (column, table) = value.split_once(':')?;
         let (table, key) = table.split_once('.').unwrap_or((table, column));
         if column.is_empty() || table.is_empty() || key.is_empty() {
-            return Err(usage());
+            return None;
         }
-        Ok(Self {
+        Some(Self {
             column: column.to_owned(),
             table: table.to_owned(),
             key: key.to_owned(),
+            pairs,
         })
+    }
+
+    /// The option's name: `join` or `pairs`.
+    fn name(&self) -> &'static str {
+        if self.pairs {
+            "pairs"
+        } else {
+            "join"
+        }
     }
 
     /// The option giving this join, for a source's origin.
     pub(crate) fn option(&self) -> String {
         format!(
-            "join={}:{}.{}",
+            "{}={}:{}.{}",
+            self.name(),
             encode(&self.column),
             encode(&self.table),
             encode(&self.key)
         )
+    }
+}
+
+/// Refuses `window=` with `pairs=`: a pair join holds every row of the source, and a window
+/// on the joined rows lets go of pairs, not of the rows behind them, which would be held for
+/// good (and their pairs made again whenever the other table changes).
+pub(crate) fn check_window(join: Option<&JoinSpec>, time: Option<&TimeSpec>) -> Result<(), String> {
+    let pairs = join.is_some_and(|join| join.pairs);
+    let window = time.is_some_and(|time| time.window.is_some());
+    if pairs && window {
+        return Err(
+            "window= cannot go with pairs= yet: the source's rows a window let go of \
+                    would stay held for their pairs; use join= (one row each), or leave out \
+                    window="
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Deletes the source's rows keyed `keys` (its key's values) from its `table`: through the
+/// join made with it, if one is (pairs are keyed by pair, not by the source's key).
+pub(crate) fn delete_rows(
+    joined: Option<&mut Joined>,
+    table: &mut LiveTable,
+    keys: &dyn Array,
+) -> Result<Changes, DataError> {
+    match joined.and_then(|joined| joined.join_for(table)) {
+        Some(join) => join.delete_left(table, keys),
+        None => table.delete(keys),
+    }
+}
+
+/// A join made: a lookup or pairs.
+pub(crate) enum Join {
+    // Boxed: the two are hundreds of bytes, of different sizes.
+    Lookup(Box<LookupJoin>),
+    Pairs(Box<PairJoin>),
+}
+
+impl Join {
+    /// Joins the source's `rows` into `out`.
+    pub(crate) fn upsert_left(
+        &mut self,
+        out: &mut LiveTable,
+        rows: RecordBatch,
+    ) -> Result<Changes, DataError> {
+        match self {
+            Self::Lookup(join) => join.upsert_left(out, rows),
+            Self::Pairs(join) => join.upsert_left(out, rows),
+        }
+    }
+
+    /// Deletes the source's rows keyed `keys` from `out`: a lookup's output is keyed as the
+    /// source is, so they go from it; pairs go through the join (their output is keyed by
+    /// pair).
+    pub(crate) fn delete_left(
+        &mut self,
+        out: &mut LiveTable,
+        keys: &dyn Array,
+    ) -> Result<Changes, DataError> {
+        match self {
+            Self::Lookup(_) => out.delete(keys),
+            Self::Pairs(join) => join.delete_left(out, keys),
+        }
+    }
+
+    fn upsert_right(
+        &mut self,
+        out: &mut LiveTable,
+        rows: RecordBatch,
+    ) -> Result<Changes, DataError> {
+        match self {
+            Self::Lookup(join) => join.upsert_right(out, rows),
+            Self::Pairs(join) => join.upsert_right(out, rows),
+        }
+    }
+
+    fn delete_right(
+        &mut self,
+        out: &mut LiveTable,
+        keys: &dyn Array,
+    ) -> Result<Changes, DataError> {
+        match self {
+            Self::Lookup(join) => join.delete_right(out, keys),
+            Self::Pairs(join) => join.delete_right(out, keys),
+        }
+    }
+
+    /// The other table's rows, as the join holds them.
+    fn right(&self) -> &LiveTable {
+        match self {
+            Self::Lookup(join) => join.right(),
+            Self::Pairs(join) => join.right(),
+        }
+    }
+
+    /// The join of `left` (the source's columns, keyed by `key`) to `right` (the other
+    /// table's, its rows keyed in the join by `right_key`) that `spec` asks for, and an
+    /// output table for it.
+    fn make(
+        spec: &JoinSpec,
+        left: &SchemaRef,
+        key: &str,
+        right: &SchemaRef,
+        right_key: &str,
+    ) -> Result<(Self, LiveTable), DataError> {
+        let (left, right) = (Arc::clone(left), Arc::clone(right));
+        if spec.pairs {
+            let join = PairJoin::new(left, key, &spec.column, right, right_key, &spec.key)?;
+            let output = join.table()?;
+            Ok((Self::Pairs(Box::new(join)), output))
+        } else {
+            let join = LookupJoin::new(left, key, &spec.column, right, &spec.key)?;
+            let output = join.table()?;
+            Ok((Self::Lookup(Box::new(join)), output))
+        }
     }
 }
 
@@ -108,7 +260,7 @@ enum State {
 
 /// A join made.
 struct Linked {
-    join: LookupJoin,
+    join: Join,
     /// The source's own columns, first in the joined table.
     left: SchemaRef,
     /// The instance of the joined table.
@@ -116,10 +268,13 @@ struct Linked {
     /// The instance of the other table it was made from.
     reference: u64,
     /// The other table's columns the join takes, their names in the join, and where its
-    /// key is among them.
+    /// rows' keys in the join are among them.
     columns: Vec<usize>,
     schema: SchemaRef,
     key_at: usize,
+    /// The other table's column keying its rows in the join: the one looked up in, or, for
+    /// pairs, its own key.
+    right_key: String,
     /// The other table's removals seen when it was last checked for rows that left, when
     /// that was, and how long until the next check.
     deletions: u64,
@@ -208,7 +363,7 @@ impl Joined {
     }
 
     /// The join, once made with `table` its output: the source's rows go in through it.
-    pub(crate) fn join_for(&mut self, table: &LiveTable) -> Option<&mut LookupJoin> {
+    pub(crate) fn join_for(&mut self, table: &LiveTable) -> Option<&mut Join> {
         self.follow(table);
         match &mut self.state {
             State::On(linked) => Some(&mut linked.join),
@@ -228,6 +383,9 @@ impl Joined {
     pub(crate) fn describe(&self) -> String {
         let spec = &self.spec;
         let mut text = match &self.state {
+            State::On(_) if spec.pairs => {
+                format!("paired with rows of {} on {}", spec.table, spec.column)
+            }
             State::On(_) => format!("joined with {} on {}", spec.table, spec.column),
             State::Waiting(why) => format!("join waiting: {why}"),
             State::Off { why, .. } => format!("join off: {why}"),
@@ -245,9 +403,7 @@ impl Joined {
             return false;
         };
         match &self.state {
-            State::On(linked) if linked.reference == instance => {
-                linked.prune_due(&self.spec, offer)
-            }
+            State::On(linked) if linked.reference == instance => linked.prune_due(offer),
             State::Off { reference, .. } => *reference != Some(instance),
             _ => !offer.joined,
         }
@@ -309,7 +465,7 @@ impl Joined {
     /// source back its own columns.
     fn off(&mut self, table: &LiveTable, key: &str, why: String, instance: u64) -> Stepped {
         let own = match &self.state {
-            State::On(linked) => Some(plain(table, &linked.left, key)),
+            State::On(linked) => Some(plain(linked, table, key)),
             _ => None,
         };
         let reference = Some(instance);
@@ -331,37 +487,44 @@ impl Joined {
     }
 }
 
-/// The source's own columns and rows in `table`: all of it, or the left columns of a join
+/// The source's own columns and rows in `table`: all of it, or the source's rows of a join
 /// made.
 fn own_rows(state: &State, table: &LiveTable) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
-    let rows = table.snapshot().map_err(|e| e.to_string())?;
     let State::On(linked) = state else {
+        let rows = table.snapshot().map_err(|e| e.to_string())?;
         return Ok((table.schema().clone(), rows));
     };
-    let left = Arc::clone(&linked.left);
-    let width = left.fields().len();
-    let rows = rows
-        .into_iter()
-        .map(|batch| RecordBatch::try_new(Arc::clone(&left), batch.columns()[..width].to_vec()))
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok((left, rows))
+    Ok((Arc::clone(&linked.left), linked.own(table)?))
 }
 
-/// A table of the source's own columns (`left`), keyed by `key`, with the rows of `table`,
-/// a join made.
-fn plain(table: &LiveTable, left: &SchemaRef, key: &str) -> Result<LiveTable, String> {
-    let width = left.fields().len();
-    let mut own = LiveTable::new(Arc::clone(left), key).map_err(|e| e.to_string())?;
-    for batch in table.snapshot().map_err(|e| e.to_string())? {
-        let batch = RecordBatch::try_new(Arc::clone(left), batch.columns()[..width].to_vec())
-            .map_err(|e| e.to_string())?;
+/// A table of the source's own columns, keyed by `key`, with its rows in `table`, the
+/// output of the join made `linked`.
+fn plain(linked: &Linked, table: &LiveTable, key: &str) -> Result<LiveTable, String> {
+    let mut own = LiveTable::new(Arc::clone(&linked.left), key).map_err(|e| e.to_string())?;
+    for batch in linked.own(table)? {
         own.upsert(batch).map_err(|e| e.to_string())?;
     }
     Ok(own)
 }
 
 impl Linked {
+    /// The source's rows, in its own columns: a pair join holds them apart (its output holds
+    /// each once per pair); a lookup's output holds each once, its columns first.
+    fn own(&self, table: &LiveTable) -> Result<Vec<RecordBatch>, String> {
+        let rows = match &self.join {
+            Join::Pairs(join) => join.left().snapshot(),
+            Join::Lookup(_) => table.snapshot(),
+        }
+        .map_err(|e| e.to_string())?;
+        let width = self.left.fields().len();
+        rows.into_iter()
+            .map(|batch| {
+                RecordBatch::try_new(Arc::clone(&self.left), batch.columns()[..width].to_vec())
+            })
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
+    }
+
     /// The join of `rows` of the source's `left` columns (keyed by `key`) to `all` the other
     /// table's, and the joined table; or why they cannot be joined.
     fn new(
@@ -377,22 +540,27 @@ impl Linked {
             return Err(format!("this source's rows have no column {}", spec.column));
         }
         if offer.schema.column_with_name(&spec.key).is_none() {
+            let (option, other) = if spec.pairs {
+                ("pairs", "OTHER")
+            } else {
+                ("join", "KEY")
+            };
             return Err(format!(
-                "{} has no column {}: join=COLUMN:{}.KEY names its column",
+                "{} has no column {}: {option}=COLUMN:{}.{other} names its column",
                 spec.table, spec.key, spec.table
             ));
         }
+        // Pairs hold each of the other table's rows by its own key; a lookup, by the value
+        // looked up.
+        let right_key = if spec.pairs { &offer.key } else { &spec.key };
         let (columns, schema) = right_columns(spec, &left, offer);
-        let key_at = schema.index_of(&spec.key).map_err(|e| e.to_string())?;
-        let join = LookupJoin::new(
-            Arc::clone(&left),
-            key,
-            &spec.column,
-            Arc::clone(&schema),
-            &spec.key,
-        )
-        .map_err(|e| e.to_string())?;
-        let mut joined = join.table().map_err(|e| e.to_string())?;
+        let key_at = columns
+            .iter()
+            .position(|&i| offer.schema.field(i).name() == right_key)
+            .ok_or_else(|| format!("{} has no column {right_key}", spec.table))?;
+        let named = schema.field(key_at).name();
+        let (join, mut joined) =
+            Join::make(spec, &left, key, &schema, named).map_err(|e| e.to_string())?;
         let mut linked = Self {
             join,
             output: joined.instance(),
@@ -401,6 +569,7 @@ impl Linked {
             columns,
             schema,
             key_at,
+            right_key: right_key.clone(),
             deletions: offer.deletions,
             updates: offer.updates,
             pruned_at: Instant::now(),
@@ -449,11 +618,12 @@ impl Linked {
     }
 
     /// Whether rows may have left the other table since it was last checked, and a check
-    /// is due: rows were deleted from it, or replaced (one keyed by another column may have
-    /// named another row).
-    fn prune_due(&self, spec: &JoinSpec, offer: &Offer) -> bool {
+    /// is due: rows were deleted from it, or replaced (in a lookup by another column than
+    /// its key, a row replaced may have named another; pairs hold rows by its key, so a row
+    /// replaced arrives in place of the old).
+    fn prune_due(&self, offer: &Offer) -> bool {
         let removed = offer.deletions != self.deletions
-            || (offer.key != spec.key && offer.updates != self.updates);
+            || (offer.key != self.right_key && offer.updates != self.updates);
         removed && self.pruned_at.elapsed() >= self.prune_every
     }
 
@@ -493,8 +663,8 @@ impl Linked {
         let mut present = HashSet::new();
         for batch in all {
             let column = batch
-                .column_by_name(&spec.key)
-                .ok_or_else(|| format!("{} has no column {}", spec.table, spec.key))?;
+                .column_by_name(&self.right_key)
+                .ok_or_else(|| format!("{} has no column {}", spec.table, self.right_key))?;
             let keys = as_text(column)?;
             present.extend(keys.iter().flatten().map(str::to_owned));
         }
@@ -519,16 +689,17 @@ impl Linked {
     }
 }
 
-/// The other table's columns the join takes (all but rows' numbers Studio gave them,
-/// unless they are looked up in), named apart from the source's own: a name both have
-/// gets the table's name in front (`sites_name`).
+/// The other table's columns the join takes, named apart from the source's own (a name
+/// both have gets the table's name in front: `sites_name`). The row numbers Studio gave
+/// the other table are left out of a lookup unless they are looked up in; pairs keep them,
+/// as they tell its rows apart.
 fn right_columns(spec: &JoinSpec, left: &Schema, offer: &Offer) -> (Vec<usize>, SchemaRef) {
     let mut taken: Vec<String> = left.fields().iter().map(|f| f.name().clone()).collect();
     let mut columns = Vec::new();
     let mut fields = Vec::new();
     for (i, field) in offer.schema.fields().iter().enumerate() {
         let name = field.name();
-        if offer.numbered && *name == offer.key && *name != spec.key {
+        if offer.numbered && *name == offer.key && *name != spec.key && !spec.pairs {
             continue;
         }
         let mut renamed = name.clone();
